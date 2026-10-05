@@ -1,0 +1,106 @@
+---
+title: "Corn_N_exploratory"
+author: "Matheus Ardigueri"
+date: "2026-07-29"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(ggplot2)
+library(readxl)
+library(lme4)
+
+
+```
+
+```{r}
+df_n_calculations <- read_excel("./data/Corn_N_calculations.xlsx") %>%
+  clean_names()
+
+df_corn_all <- read_excel("./data/Corn_all.xlsx") %>%
+  clean_names()
+```
+
+```{r}
+df__nc_long<- df_n_calculations %>%
+  pivot_longer(cols = dry) 
+
+df_n_calculations_clear
+
+```
+
+# Corn All Normality analysis.
+
+```{r}
+
+pl_cornall <- df_corn_all %>%
+  pivot_longer(cols = gsw_mol_m_2_s_1:etr_umol1_m_2_s_1,
+                names_to = "phys_var",
+               values_to = "values")
+
+ggplot(pl_cornall,
+       aes(x = n_treatmen,
+           y = values)) +
+  geom_boxplot() +
+  facet_wrap(~phys_var, scales = "free_y")
+
+```
+```{r}
+ggplot(
+  pl_cornall,
+  aes(
+    x = values
+  )
+) +
+  geom_density(alpha = 0.2, na.rm = TRUE) +
+  facet_wrap(~phys_var, scales = "free") +
+  theme_bw()
+```
+
+```{r}
+ggplot(
+  pl_cornall,
+  aes(
+    x = values,
+    colour = n_treatmen
+  )
+) +
+  geom_density(
+    linewidth = 0.8,
+    na.rm = TRUE
+  ) +
+  facet_wrap(
+    ~ phys_var,
+    scales = "free"
+  ) +
+  labs(
+    x = "Value",
+    y = "Density",
+    colour = "N treatment"
+  ) +
+  theme_bw()
+```
+```{r}
+
+
+
+```
+
+
+```{r}
+explor_g <- ggplot(df_n_calculations_clear, aes(
+  x=n_treatment,
+  y=biomass_kg_ha,
+  color=stage
+)) +
+  geom_boxplot() +
+  facet_grid(~study_field)
+
+explor_g
+```
+

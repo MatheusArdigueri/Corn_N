@@ -1,0 +1,58 @@
+---
+title: "N_ana"
+author: "Matheus Ardigueri"
+date: "2026-09-15"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(ggplot2)
+```
+
+```{r}
+
+df <- read_excel("./data/Corn_all.xlsx")
+
+df
+
+```
+
+```{r}
+df_pivot <- df %>%
+  pivot_longer(cols = 8:307,
+               names_to = "bands",
+               values_to = "reflectance")
+
+df_pivot
+```
+
+
+# Range filtering bands
+
+```{r}
+
+```
+
+
+```{r}
+
+spectralp <- ggplot(df, aes(
+  x = 
+))
+
+```
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
