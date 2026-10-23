@@ -13,44 +13,136 @@ library(readxl)
 library(ggplot2)
 ```
 
+# Importing First DF (ALL DATA)
+
 ```{r}
 
-df <- read_excel("./data/Corn_all.xlsx")
+df <- read_excel("../data/Corn_all.xlsx")
 
 df
 
 ```
 
+# Range filtering bands
+
 ```{r}
-df_pivot <- df %>%
-  pivot_longer(cols = 8:307,
-               names_to = "bands",
-               values_to = "reflectance")
+df_filtered <- df %>%
+  select(
+    1:7,
+    Band_5:Band_293
+  )
+
+df_filtered
+```
+
+
+
+```{r}
+df_pivot <- df_filtered %>%
+  pivot_longer(
+    cols = starts_with("Band_"),
+    names_to = "bands",
+    values_to = "reflectance"
+  )
 
 df_pivot
 ```
 
 
-# Range filtering bands
+# Creating Numeric wavelength column
+
+```{r}
+df_pivot <- df_pivot %>%
+  mutate(
+    band_number = as.numeric(gsub("Band_", "", bands)),
+    wavelength = 393.80 + (band_number - 1) * 2.02
+  )
+
+df_pivot
+```
+
+# Checking wavelength distributions.
 
 ```{r}
 
+spectral_p <- ggplot(
+  df_pivot,
+  aes(
+    x = wavelength,
+    y = reflectance,
+    group = interaction(ID, DAP),
+    color = as.factor(`N_treatmen`)
+  )
+) +
+  geom_line(alpha = 0.6) +
+  labs(
+    x = "Wavelength (nm)",
+    y = "Reflectance",
+    color = "N treatment"
+  ) +
+  theme_bw()
+
+spectral_p
+
 ```
 
+# Importing Corn ALL calcultaions and repeating same step-by-step.
 
 ```{r}
 
-spectralp <- ggplot(df, aes(
-  x = 
-))
+df2 <- read_excel("../data/Corn_N_calculations.xlsx")
 
+df2
 ```
 
 ```{r}
+df2_filtered <- df2 %>%
+  select(
+    1:16,
+    Band_5:Band_293
+  )
 
+df2_filtered
 ```
+```{r}
+df2_pivot <- df2_filtered %>%
+  pivot_longer(
+    cols = starts_with("Band_"),
+    names_to = "bands",
+    values_to = "reflectance"
+  )
 
+df2_pivot
+```
+```{r}
+df2_pivot <- df2_pivot %>%
+  mutate(
+    band_number = as.numeric(gsub("Band_", "", bands)),
+    wavelength = 393.80 + (band_number - 1) * 2.02
+  )
 
+df2_pivot
+```
+```{r}
+spectral_p2 <- ggplot(
+  df2_pivot,
+  aes(
+    x = wavelength,
+    y = reflectance,
+    group = interaction(ID, DAP),
+    color = as.factor(`N_Treatment`)
+  )
+) +
+  geom_line(alpha = 0.6) +
+  labs(
+    x = "Wavelength (nm)",
+    y = "Reflectance",
+    color = "N treatment"
+  ) +
+  theme_bw()
+
+spectral_p2
+```
 
 ```{r}
 

@@ -18,89 +18,254 @@ library(lme4)
 
 ```
 
-```{r}
-df_n_calculations <- read_excel("./data/Corn_N_calculations.xlsx") %>%
-  clean_names()
-
-df_corn_all <- read_excel("./data/Corn_all.xlsx") %>%
-  clean_names()
-```
+# Exploratory N Calculations Corn.
 
 ```{r}
-df__nc_long<- df_n_calculations %>%
-  pivot_longer(cols = dry) 
+df_corn_calculations <- read_excel("../data/Corn_N_calculations.xlsx", sheet = "R6 Combined_real")
+df_corn_calculations
 
-df_n_calculations_clear
+
 
 ```
 
-# Corn All Normality analysis.
 
 ```{r}
+df_corn_calc_pivot <- df_corn_calculations %>%
+  pivot_longer( cols = 9:13,
+                names_to = "parameters",
+                values_to = "values")
 
-pl_cornall <- df_corn_all %>%
-  pivot_longer(cols = gsw_mol_m_2_s_1:etr_umol1_m_2_s_1,
-                names_to = "phys_var",
-               values_to = "values")
-
-ggplot(pl_cornall,
-       aes(x = n_treatmen,
-           y = values)) +
-  geom_boxplot() +
-  facet_wrap(~phys_var, scales = "free_y")
-
-```
-```{r}
-ggplot(
-  pl_cornall,
-  aes(
-    x = values
-  )
-) +
-  geom_density(alpha = 0.2, na.rm = TRUE) +
-  facet_wrap(~phys_var, scales = "free") +
-  theme_bw()
+df_corn_calc_pivot
 ```
 
+
+
+
 ```{r}
-ggplot(
-  pl_cornall,
-  aes(
-    x = values,
-    colour = n_treatmen
-  )
-) +
+ggplot(data = df_corn_calc_pivot,
+         aes(x = values)) +
+  geom_density() +
+  facet_grid(~parameters, scales = "free")
+```
+```{r}
+ggplot(df_corn_calc_pivot,
+       aes(x = values)) +
   geom_density(
+    fill = "#2C7FB8",
+    color = "black",
+    alpha = 0.5,
     linewidth = 0.8,
     na.rm = TRUE
   ) +
   facet_wrap(
-    ~ phys_var,
-    scales = "free"
+    ~ parameters,
+    scales = "free",
+    ncol = 3
   ) +
   labs(
-    x = "Value",
-    y = "Density",
-    colour = "N treatment"
+    title = "Distribution of Corn Nitrogen-Related Parameters",
+    x = "Parameter value",
+    y = "Density"
   ) +
-  theme_bw()
+  theme_bw(base_size = 14) +
+  theme(
+    strip.text = element_text(
+      face = "bold",
+      size = 11
+    ),
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    panel.grid.minor = element_blank()
+  )
 ```
 ```{r}
+ggplot(df_corn_calc_pivot,
+       aes(sample = values)) +
+  stat_qq(
+    size = 1,
+    alpha = 0.5
+  ) +
+  stat_qq_line(
+    color = "red",
+    linewidth = 0.8
+  ) +
+  facet_wrap(
+    ~ parameters,
+    scales = "free",
+    ncol = 3
+  ) +
+  labs(
+    title = "Q-Q Plots of Corn Nitrogen Parameters",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_bw(base_size = 14)
+```
 
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
 
+df_corr <- df_corn_calculations %>%
+  select(
+    NNI_Leaf	,
+    NNI_Stalk,
+   NNI_Ear,
+    `R1 NNI`,
+   `R6_NNI_Combined`
+  ) %>%
+  cor(
+    use = "pairwise.complete.obs",
+    method = "pearson"
+  )
 
+df_corr %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable_1") %>%
+  pivot_longer(
+    cols = -Variable_1,
+    names_to = "Variable_2",
+    values_to = "Correlation"
+  ) %>%
+  ggplot(aes(
+    x = Variable_1,
+    y = Variable_2,
+    fill = Correlation
+  )) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = round(Correlation, 2)),
+    size = 4
+  ) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  labs(
+    title = "Correlation Among Corn Nitrogen Parameters",
+    x = NULL,
+    y = NULL,
+    fill = "Pearson r"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    panel.grid = element_blank()
+  )
+```
+
+```{r}
+ggplot(df_corn_calculations,
+       aes(
+         x = factor(DAP),
+         y = NNI_Leaf, color =`Study/Field`
+       )) +
+  geom_boxplot(
+    fill = "#2C7FB8",
+    alpha = 0.6,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.12,
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  labs(
+    title = "Variation in Corn NNI Across Sampling Dates",
+    x = "Days After Planting",
+    y = "Nitrogen Nutrition Index"
+  ) +
+  theme_bw(base_size = 14)
+```
+```{r}
+ggplot(df_corn_calculations,
+       aes(
+         x = factor(DAP),
+         y = NNI_Ear, color =`Study/Field`
+       )) +
+  geom_boxplot(
+    fill = "#2C7FB8",
+    alpha = 0.6,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.12,
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  labs(
+    title = "Variation in Corn NNI Across Sampling Dates",
+    x = "Days After Planting",
+    y = "Nitrogen Nutrition Index"
+  ) +
+  theme_bw(base_size = 14)
+```
+
+```{r}
+ggplot(df_corn_calculations,
+       aes(
+         x = factor(DAP),
+         y = NNI_Stalk, color =`Study/Field`	
+       )) +
+  geom_boxplot(
+    fill = "#2C7FB8",
+    alpha = 0.6,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.12,
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  labs(
+    title = "Variation in Corn NNI Across Sampling Dates",
+    x = "Days After Planting",
+    y = "Nitrogen Nutrition Index"
+  ) +
+  theme_bw(base_size = 14)
 ```
 
 
 ```{r}
-explor_g <- ggplot(df_n_calculations_clear, aes(
-  x=n_treatment,
-  y=biomass_kg_ha,
-  color=stage
-)) +
-  geom_boxplot() +
-  facet_grid(~study_field)
+ggplot(df_corn_calculations,
+       aes(
+         x = factor(DAP),
+         y = R6_NNI_Combined, color =`Study/Field`		
+       )) +
+  geom_boxplot(
+    fill = "#2C7FB8",
+    alpha = 0.6,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.12,
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  labs(
+    title = "Variation in Corn NNI Across Sampling Dates",
+    x = "Days After Planting",
+    y = "Nitrogen Nutrition Index"
+  ) +
+  theme_bw(base_size = 14)
+```
 
-explor_g
+# Now for biomass and other parameters.
+
+```{r}
+df_corn_all <- read_excel("../data/Corn_all.xlsx")
+
+df_corn_all
+
 ```
 

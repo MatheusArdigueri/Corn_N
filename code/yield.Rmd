@@ -1,0 +1,99 @@
+---
+title: "yield_analysis"
+author: "Matheus Ardigueri"
+date: "2026-10-13"
+output: html_document
+---
+
+```{r}
+library(agricolae)
+library(dplyr)
+library(janitor)
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(tidyr)
+```
+
+```{r}
+
+yield_1 <- read_excel("./data/yield_data_analysis.xlsx") %>%
+  clean_names() 
+
+yield1_longer <- yield_1 %>%
+  pivot_longer(cols =  "ngpc":"yield_estimation_bu_ac_1",
+               names_to = "variables",
+               values_to = "values")
+
+yield_midville <- read_excel("./data/yield_midville.xlsx") %>%
+  clean_names()
+
+```
+
+```{r}
+
+boxplot <- ggplot(data = yield_1,
+                  aes( x = id,
+                       y = yield_kg_ha_1,
+                       color = ntreat)) +
+  geom_boxplot(outliers = TRUE) +
+  geom_jitter() +
+  facet_wrap(~biological) +
+  theme_classic()
+
+boxplot  
+  
+```
+
+```{r}
+boxplot2 <- ggplot(data = yield_midville,
+                  aes( x = id,
+                       y = yield_kg_ha_1,
+                       color = ntreat)) +
+  geom_boxplot(outliers = TRUE) +
+  geom_jitter() +
+  facet_wrap(~biofertilizer) +
+  theme_classic()
+
+boxplot2
+```
+
+```{r}
+scat_plot <- ggplot(data = yield1_longer,
+                    aes(y = values,
+                        x = id)) +
+  geom_jitter() +
+  facet_wrap(~variables, scales = "free" ) +
+  theme_bw()
+
+scat_plot
+```
+
+```{r}
+box_plot <- ggplot(data = yield1_longer,
+                    aes(y = values,
+                        x = id,
+                        color = biological)) +
+  geom_jitter() +
+  geom_boxplot() +
+  facet_wrap(~variables, scales = "free" ) +
+  theme_bw()
+
+box_plot
+```
+
+
+
+```{r}
+dist_plot <- ggplot(data = yield1_longer,
+                    aes(x = values)) +
+  geom_density() +
+  facet_wrap(~variables, scales = "free" ) +
+  theme_bw()
+
+dist_plot
+```
+```{r}
+
+```
+

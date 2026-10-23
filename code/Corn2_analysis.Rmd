@@ -1,0 +1,853 @@
+---
+title: '2'
+author: "Matheus Ardigueri"
+date: "2026-10-21"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+corn_data <- corn_all %>%
+  mutate(
+    N_Treatment = as.factor(N_Treatment),
+    `Study/Field` = as.factor(`Study/Field`),
+    Year = as.factor(Year),
+    Stage = as.factor(Stage),
+    ID = as.factor(ID)
+  )
+```
+
+```{r}
+corn_data %>%
+  distinct(
+    `Study/Field`,
+    Year,
+    Stage,
+    DAP,
+    N_Treatment
+  ) %>%
+  arrange(
+    `Study/Field`,
+    Year,
+    DAP
+  )
+```
+
+```{r}
+corn_data %>%
+  group_by(
+    `Study/Field`,
+    Year,
+    Stage,
+    DAP,
+    N_Treatment
+  ) %>%
+  summarise(
+    n = n(),
+    n_NNI = sum(!is.na(NNI)),
+    n_PNC = sum(!is.na(`PNC_g/kg`)),
+    n_PNU = sum(!is.na(`PNU_kg/ha`)),
+    .groups = "drop"
+  )
+```
+
+```{r}
+corn_data <- corn_data %>%
+  mutate(
+    Experiment = interaction(
+      `Study/Field`,
+      Year,
+      drop = TRUE
+    ),
+    Plot_ID = interaction(
+      `Study/Field`,
+      Year,
+      ID,
+      drop = TRUE
+    )
+  )
+```
+
+```{r}
+corn_data %>%
+  group_by(
+    Experiment,
+    Stage
+  ) %>%
+  summarise(
+    Total = n(),
+    NNI = sum(!is.na(NNI)),
+    PNC = sum(!is.na(`PNC_g/kg`)),
+    PNU = sum(!is.na(`PNU_kg/ha`)),
+    .groups = "drop"
+  )
+```
+
+```{r}
+corn_data <- corn_data %>%
+  mutate(
+    Complete_Spectra = if_all(
+      starts_with("Band_"),
+      ~ !is.na(.x)
+    ),
+    Complete_Nitrogen = if_all(
+      c(
+        NNI,
+        `PNC_g/kg`,
+        `PNU_kg/ha`
+      ),
+      ~ !is.na(.x)
+    )
+  )
+```
+
+```{r}
+df_nitrogen <- corn_data %>%
+  select(
+    Experiment,
+    Stage,
+    DAP,
+    N_Treatment,
+    ID,
+    NNI,
+    `PNC_g/kg`,
+    `PNU_kg/ha`
+  ) %>%
+  pivot_longer(
+    cols = c(
+      NNI,
+      `PNC_g/kg`,
+      `PNU_kg/ha`
+    ),
+    names_to = "Parameter",
+    values_to = "Value"
+  )
+```
+
+```{r}
+experiment_1 <- levels(corn_data$Experiment)[1]
+
+df_nitrogen %>%
+  filter(Experiment == experiment_1) %>%
+  ggplot(aes(
+    x = N_Treatment,
+    y = Value,
+    fill = N_Treatment
+  )) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.12,
+    alpha = 0.4,
+    size = 1.2
+  ) +
+  facet_grid(
+    Parameter ~ Stage,
+    scales = "free_y"
+  ) +
+  labs(
+    title = paste(
+      "Corn Nitrogen Status:",
+      experiment_1
+    ),
+    x = "Nitrogen Treatment",
+    y = "Measured Value"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold")
+  )
+```
+
+```{r}
+experiment_2 <- levels(corn_data$Experiment)[2]
+
+df_nitrogen %>%
+  filter(Experiment == experiment_2) %>%
+  ggplot(aes(
+    x = N_Treatment,
+    y = Value,
+    fill = N_Treatment
+  )) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.12,
+    alpha = 0.4,
+    size = 1.2
+  ) +
+  facet_grid(
+    Parameter ~ Stage,
+    scales = "free_y"
+  ) +
+  labs(
+    title = paste(
+      "Corn Nitrogen Status:",
+      experiment_2
+    ),
+    x = "Nitrogen Treatment",
+    y = "Measured Value"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold")
+  )
+```
+
+```{r}
+corn_spectral <- corn_data %>%
+  select(
+    Experiment,
+    Plot_ID,
+    N_Treatment,
+    Year,
+    Stage,
+    Date,
+    DAP,
+    ID,
+    NNI,
+    `PNC_g/kg`,
+    `PNU_kg/ha`,
+    Band_5:Band_293
+  )
+```
+
+```{r}
+corn_spectral_long <- corn_spectral %>%
+  pivot_longer(
+    cols = starts_with("Band_"),
+    names_to = "Band",
+    values_to = "Reflectance"
+  ) %>%
+  mutate(
+    Band_Number = as.numeric(
+      sub("Band_", "", Band)
+    )
+  )
+```
+
+```{r}
+corn_spectral_long %>%
+  filter(
+    Experiment == experiment_1
+  ) %>%
+  ggplot(aes(
+    x = Band_Number,
+    y = Reflectance,
+    group = interaction(Plot_ID, Date),
+    color = N_Treatment
+  )) +
+  geom_line(
+    alpha = 0.5,
+    linewidth = 0.5
+  ) +
+  labs(
+    title = paste(
+      "Corn Hyperspectral Reflectance:",
+      experiment_1
+    ),
+    x = "Hyperspectral Band",
+    y = "Reflectance",
+    color = "N Treatment"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+corn_spectral_long %>%
+  filter(
+    Experiment == experiment_2
+  ) %>%
+  ggplot(aes(
+    x = Band_Number,
+    y = Reflectance,
+    group = interaction(Plot_ID, Date),
+    color = N_Treatment
+  )) +
+  geom_line(
+    alpha = 0.5,
+    linewidth = 0.5
+  ) +
+  labs(
+    title = paste(
+      "Corn Hyperspectral Reflectance:",
+      experiment_2
+    ),
+    x = "Hyperspectral Band",
+    y = "Reflectance",
+    color = "N Treatment"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+corn_spectral_mean <- corn_spectral_long %>%
+  group_by(
+    Experiment,
+    Stage,
+    DAP,
+    N_Treatment,
+    Band_Number
+  ) %>%
+  summarise(
+    Mean_Reflectance = mean(
+      Reflectance,
+      na.rm = TRUE
+    ),
+    SD_Reflectance = sd(
+      Reflectance,
+      na.rm = TRUE
+    ),
+    n = sum(!is.na(Reflectance)),
+    .groups = "drop"
+  )
+```
+
+```{r}
+corn_spectral_mean %>%
+  filter(
+    Experiment == experiment_1
+  ) %>%
+  ggplot(aes(
+    x = Band_Number,
+    y = Mean_Reflectance,
+    color = N_Treatment
+  )) +
+  geom_line(
+    linewidth = 1.1
+  ) +
+  facet_wrap(
+    ~ Stage
+  ) +
+  labs(
+    title = paste(
+      "Mean Hyperspectral Reflectance:",
+      experiment_1
+    ),
+    x = "Hyperspectral Band",
+    y = "Mean Reflectance",
+    color = "N Treatment"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    strip.text = element_text(
+      face = "bold"
+    ),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+corn_spectral_mean %>%
+  filter(
+    Experiment == experiment_2
+  ) %>%
+  ggplot(aes(
+    x = Band_Number,
+    y = Mean_Reflectance,
+    color = N_Treatment
+  )) +
+  geom_line(
+    linewidth = 1.1
+  ) +
+  facet_wrap(
+    ~ Stage
+  ) +
+  labs(
+    title = paste(
+      "Mean Hyperspectral Reflectance:",
+      experiment_2
+    ),
+    x = "Hyperspectral Band",
+    y = "Mean Reflectance",
+    color = "N Treatment"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    strip.text = element_text(
+      face = "bold"
+    ),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+corn_spectral_mean %>%
+  filter(
+    Experiment == experiment_1
+  ) %>%
+  ggplot(aes(
+    x = Band_Number,
+    y = Mean_Reflectance,
+    color = N_Treatment,
+    fill = N_Treatment
+  )) +
+  geom_ribbon(
+    aes(
+      ymin = Mean_Reflectance - SD_Reflectance,
+      ymax = Mean_Reflectance + SD_Reflectance
+    ),
+    alpha = 0.12,
+    color = NA
+  ) +
+  geom_line(
+    linewidth = 1
+  ) +
+  facet_wrap(
+    ~ Stage
+  ) +
+  labs(
+    title = "Corn Spectral Reflectance by Nitrogen Treatment",
+    x = "Hyperspectral Band",
+    y = "Mean Reflectance ± SD",
+    color = "N Treatment",
+    fill = "N Treatment"
+  ) +
+  theme_bw(base_size = 14)
+```
+```{r}
+corn_spectral_mean %>%
+  filter(
+    Experiment == experiment_2
+  ) %>%
+  ggplot(aes(
+    x = Band_Number,
+    y = Mean_Reflectance,
+    color = N_Treatment,
+    fill = N_Treatment
+  )) +
+  geom_ribbon(
+    aes(
+      ymin = Mean_Reflectance - SD_Reflectance,
+      ymax = Mean_Reflectance + SD_Reflectance
+    ),
+    alpha = 0.12,
+    color = NA
+  ) +
+  geom_line(
+    linewidth = 1
+  ) +
+  facet_wrap(
+    ~ Stage
+  ) +
+  labs(
+    title = "Corn Spectral Reflectance by Nitrogen Treatment",
+    x = "Hyperspectral Band",
+    y = "Mean Reflectance ± SD",
+    color = "N Treatment",
+    fill = "N Treatment"
+  ) +
+  theme_bw(base_size = 14)
+```
+```{r}
+corn_spectral_mean %>%
+  ggplot(aes(
+    x = Band_Number,
+    y = Mean_Reflectance,
+    color = N_Treatment
+  )) +
+  geom_line(
+    linewidth = 0.9
+  ) +
+  facet_grid(
+    Experiment ~ Stage,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Corn Hyperspectral Reflectance Across Experiments",
+    x = "Hyperspectral Band",
+    y = "Mean Reflectance",
+    color = "N Treatment"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+exp_pca <- experiment_1
+stage_pca <- "R1"
+```
+
+```{r}
+pca_data <- corn_data %>%
+  filter(
+    Experiment == exp_pca,
+    Stage == stage_pca
+  )
+```
+
+```{r}
+band_cols <- names(corn_data) %>%
+  .[grepl("^Band_", .)] 
+```
+
+```{r}
+band_cols <- names(corn_data) %>%
+  .[grepl("^Band_", .)] 
+
+band_cols <- band_cols[5:293]
+```
+
+```{r}
+complete_idx <- complete.cases(
+  pca_data[, band_cols]
+)
+```
+
+```{r}
+pca_meta <- pca_data %>%
+  filter(complete_idx) %>%
+  select(
+    Plot_ID,
+    N_Treatment,
+    Experiment,
+    Stage,
+    DAP,
+    NNI,
+    `PNC_g/kg`,
+    `PNU_kg/ha`
+  )
+```
+
+```{r}
+pca_spectra <- pca_data %>%
+  filter(complete_idx) %>%
+  select(all_of(band_cols))
+```
+
+```{r}
+pca_model <- prcomp(
+  pca_spectra,
+  center = TRUE,
+  scale. = TRUE
+)
+
+summary(pca_model)
+```
+
+```{r}
+pca_var <- data.frame(
+  PC = paste0(
+    "PC",
+    1:length(pca_model$sdev)
+  ),
+  Variance = (pca_model$sdev^2) /
+    sum(pca_model$sdev^2),
+  Cumulative = cumsum(
+    (pca_model$sdev^2) /
+    sum(pca_model$sdev^2)
+  )
+)
+
+head(pca_var, 10)
+```
+
+```{r}
+ggplot(
+  pca_var[1:15, ],
+  aes(
+    x = reorder(PC, seq_along(PC)),
+    y = Variance
+  )
+) +
+  geom_col(fill = "steelblue") +
+  geom_point(size = 2) +
+  geom_line(
+    aes(group = 1)
+  ) +
+  labs(
+    title = paste(
+      "Scree Plot:",
+      exp_pca,
+      "-",
+      stage_pca
+    ),
+    x = "Principal Component",
+    y = "Proportion of Variance"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+pca_scores <- as.data.frame(
+  pca_model$x
+)
+
+pca_scores <- bind_cols(
+  pca_meta,
+  pca_scores
+)
+
+head(pca_scores)
+```
+
+```{r}
+ggplot(
+  pca_scores,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = N_Treatment
+  )
+) +
+  geom_point(
+    size = 3,
+    alpha = 0.8
+  ) +
+  labs(
+    title = paste(
+      "PCA Scores:",
+      exp_pca,
+      "-",
+      stage_pca
+    ),
+    x = "PC1",
+    y = "PC2",
+    color = "N Treatment"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+```{r}
+ggplot(
+  pca_scores,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = N_Treatment,
+    label = Plot_ID
+  )
+) +
+  geom_point(
+    size = 3,
+    alpha = 0.8
+  ) +
+  geom_text(
+    size = 3,
+    vjust = -0.7
+  ) +
+  labs(
+    title = paste(
+      "PCA Scores:",
+      exp_pca,
+      "-",
+      stage_pca
+    ),
+    x = "PC1",
+    y = "PC2",
+    color = "N Treatment"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+```{r}
+pca_loadings <- as.data.frame(
+  pca_model$rotation
+)
+
+pca_loadings$Band <- rownames(
+  pca_loadings
+)
+
+pca_loadings$Band_Number <- as.numeric(
+  sub(
+    "Band_",
+    "",
+    pca_loadings$Band
+  )
+)
+
+head(pca_loadings)
+```
+
+```{r}
+ggplot(
+  pca_loadings,
+  aes(
+    x = Band_Number,
+    y = PC1
+  )
+) +
+  geom_line(
+    linewidth = 1
+  ) +
+  labs(
+    title = paste(
+      "PC1 Loadings:",
+      exp_pca,
+      "-",
+      stage_pca
+    ),
+    x = "Band Number",
+    y = "Loading"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+ggplot(
+  pca_loadings,
+  aes(
+    x = Band_Number,
+    y = PC2
+  )
+) +
+  geom_line(
+    linewidth = 1
+  ) +
+  labs(
+    title = paste(
+      "PC2 Loadings:",
+      exp_pca,
+      "-",
+      stage_pca
+    ),
+    x = "Band Number",
+    y = "Loading"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+top_pc1 <- pca_loadings %>%
+  mutate(
+    abs_PC1 = abs(PC1)
+  ) %>%
+  arrange(desc(abs_PC1)) %>%
+  select(
+    Band,
+    Band_Number,
+    PC1,
+    abs_PC1
+  )
+
+head(top_pc1, 15)
+```
+
+```{r}
+top_pc2 <- pca_loadings %>%
+  mutate(
+    abs_PC2 = abs(PC2)
+  ) %>%
+  arrange(desc(abs_PC2)) %>%
+  select(
+    Band,
+    Band_Number,
+    PC2,
+    abs_PC2
+  )
+
+head(top_pc2, 15)
+```
+
+```{r}
+pca_cor <- pca_scores %>%
+  select(
+    PC1,
+    PC2,
+    PC3,
+    NNI,
+    `PNC_g/kg`,
+    `PNU_kg/ha`
+  ) %>%
+  cor(
+    use = "pairwise.complete.obs",
+    method = "pearson"
+  )
+
+round(pca_cor, 2)
+```
+```{r}
+pca_scores %>%
+  pivot_longer(
+    cols = c(
+      NNI,
+      `PNC_g/kg`,
+      `PNU_kg/ha`
+    ),
+    names_to = "Parameter",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(
+    x = PC1,
+    y = Value,
+    color = N_Treatment
+  )) +
+  geom_point(size = 3) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "black"
+  ) +
+  facet_wrap(
+    ~ Parameter,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Relationship Between PC1 and Nitrogen Status",
+    x = "PC1 Score",
+    y = "Nitrogen Parameter"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+pca_scores %>%
+  ggplot(aes(
+    x = PC2,
+    y = NNI,
+    color = N_Treatment
+  )) +
+  geom_point(size = 3) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "black"
+  ) +
+  labs(
+    title = "PC2 vs Nitrogen Nutrition Index",
+    x = "PC2 Score",
+    y = "NNI"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+pca_scores %>%
+  select(
+    Plot_ID,
+    N_Treatment,
+    PC1,
+    PC2,
+    NNI,
+    `PNC_g/kg`,
+    `PNU_kg/ha`
+  ) %>%
+  arrange(desc(abs(PC1))) %>%
+  head(10)
+```
+
+```{r}
+pca_scores %>%
+  arrange(desc(abs(PC2))) %>%
+  select(
+    Plot_ID,
+    N_Treatment,
+    PC1,
+    PC2
+  ) %>%
+  head(10)
+```
+
+```{r}
+
+```
+

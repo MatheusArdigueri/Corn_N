@@ -1,0 +1,216 @@
+---
+title: "Untitled"
+author: "Matheus Ardigueri"
+date: "2026-10-21"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidymodels)
+library(ggplot2)
+library(janitor)
+library(tidyverse)
+library(randomForest)
+library(xgboost)
+library(readxl)
+library(glmnet)
+library(purrr)
+library(stringr)
+library(ranger)
+
+```
+
+```{r}
+corn_all <- read_excel("./data/thiago2024/Corn_N_calculations.xlsx")
+corn_all
+
+```
+
+```{r}
+glimpse(corn_all)
+
+names(corn_all)
+
+dim(corn_all)
+
+summary(corn_all)
+```
+
+```{r}
+bands <- corn_all %>%
+  select(starts_with("Band_"))
+```
+
+```{r}
+dim(bands)
+
+names(bands)
+```
+```{r}
+df_filtered <- corn_all %>%
+  select(
+    -starts_with("Band_"),
+    Band_5:Band_293
+  )
+
+df_filtered
+```
+
+```{r}
+df_spectral <- df_filtered %>%
+  pivot_longer(
+    cols = starts_with("Band_"),
+    names_to = "band",
+    values_to = "reflectance"
+  )
+```
+
+```{r}
+df_spectral <- df_spectral %>%
+  mutate(
+    band_number = as.numeric(
+      str_remove(band, "Band_")
+    )
+  )
+```
+
+```{r}
+corn_all %>%
+  summarise(
+    across(
+      everything(),
+      ~ sum(is.na(.))
+    )
+  )
+```
+
+```{r}
+corn_all %>%
+  count(N_Treatment)
+```
+```{r}
+corn_all %>%
+  count(DAP)
+```
+```{r}
+corn_all %>%
+  count(
+    N_Treatment,
+    DAP
+  )
+```
+
+```{r}
+names(corn_all)
+```
+
+
+```{r}
+df_nitrogen <- corn_all %>%
+  select(
+    N_Treatment,
+    DAP,
+    ID,
+    NNI,
+    `PNC_g/kg`,
+    `PNU_kg/ha`
+  )
+
+df_nitrogen %>%
+  pivot_longer(
+    cols = c(
+      NNI,
+    `PNC_g/kg`,
+    `PNU_kg/ha`
+    ),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = value)) +
+  geom_density(
+    fill = "steelblue",
+    alpha = 0.5,
+    na.rm = TRUE
+  ) +
+  facet_wrap(
+    ~ parameter,
+    scales = "free"
+  ) +
+  theme_bw()
+
+```
+
+```{r}
+df_nitrogen %>%
+  pivot_longer(
+    cols = c(
+      NNI,
+      `PNC_g/kg`,
+      `PNU_kg/ha`
+    ),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(
+    x = N_Treatment,
+    y = value,
+    fill = N_Treatment
+  )) +
+  geom_boxplot(
+    alpha = 0.6,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  facet_wrap(
+    ~ parameter,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Corn Nitrogen Status by Fertilization Treatment",
+    x = "Nitrogen Treatment",
+    y = "Measured Value"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none"
+  )
+```
+
+```{r}
+df_nitrogen %>%
+  pivot_longer(
+    cols = c(
+      NNI,
+      `PNC_g/kg`,
+      `PNU_kg/ha`
+    ),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(
+    x = factor(DAP),
+    y = value,
+    fill = N_Treatment
+  )) +
+  geom_boxplot(
+    alpha = 0.7,
+    position = position_dodge(width = 0.8)
+  ) +
+  facet_wrap(
+    ~ parameter,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Corn Nitrogen Status Across Sampling Dates",
+    x = "Days After Planting",
+    y = "Measured Value",
+    fill = "N Treatment"
+  ) +
+  theme_bw()
+```
+

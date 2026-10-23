@@ -1,0 +1,309 @@
+```{r}
+# ================================================================
+# Corn NNI: Elastic Net band selection + SVM, RF, XGBoost
+# Fully nested preprocessing / feature selection / grid tuning
+# Outer LOOCV, inner 5-fold CV, grouped by 'group'
+# Output: ./output_2/
+# ================================================================
+
+required <- c('readr','dplyr','tidyr','purrr','ggplot2',
+              'recipes','parsnip','glmnet','rsample','kernlab','ranger','xgboost')
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing)) stop('Install packages: install.packages(c(',
+                          paste(sprintf('"%s"', missing), collapse=', '), '))')
+
+SEED <- 123L
+set.seed(SEED)
+INPUT_FILE <- './output/df_clean_names.csv'
+OUTPUT_DIR <- './output_3'
+TARGET <- 'r6_nni_combined'
+GROUPS <- c('V8','R1-R2','R5-R6')
+MAX_BANDS <- 5L
+INNER_V <- 5L
+RF_TREES <- 300L
+# For initial debugging: change to c('V8') and then restore GROUPS.
+GROUPS_TO_RUN <- GROUPS
+
+dir.create(OUTPUT_DIR, recursive=TRUE, showWarnings=FALSE)
+if (!file.exists(INPUT_FILE)) stop('Input not found: ', INPUT_FILE)
+df <- readr::read_csv(INPUT_FILE, show_col_types=FALSE)
+bands <- grep('^band_[0-9]+$', names(df), value=TRUE)
+stopifnot('group' %in% names(df), TARGET %in% names(df), length(bands)>0L)
+if (!all(vapply(df[bands], is.numeric, logical(1)))) stop('Bands must be numeric')
+
+# ------------------------------------------------
+# Metrics (prediction R2 can be negative)
+# ------------------------------------------------
+metrics <- function(obs, pred) {
+  if (length(obs)<2L || length(obs)!=length(pred) || any(!is.finite(c(obs,pred))))
+    stop('Invalid observed or predicted values')
+  e <- pred-obs
+  rmse <- sqrt(mean(e^2)); sst <- sum((obs-mean(obs))^2)
+  data.frame(R2=if (sst>0) 1-sum(e^2)/sst else NA_real_,
+             RMSE=rmse, MAE=mean(abs(e)), Bias=mean(e),
+             RPD=if (rmse>0) stats::sd(obs)/rmse else NA_real_,
+             RPIQ=if (rmse>0) stats::IQR(obs)/rmse else NA_real_,
+             nRMSE=if (abs(mean(obs))>0) 100*rmse/abs(mean(obs)) else NA_real_)
+}
+
+# ------------------------------------------------
+# Elastic Net: training data ONLY; select up to 5 bands
+# ------------------------------------------------
+select_bands <- function(train, seed, k=MAX_BANDS) {
+  x <- as.matrix(train[, bands, drop=FALSE]); y <- train[[TARGET]]
+  s <- apply(x, 2L, stats::sd)
+  keep <- names(s)[is.finite(s) & s > 1e-10]
+  if (!length(keep)) stop('No varying predictors in training partition')
+  x <- x[, keep, drop=FALSE]
+  set.seed(seed)
+  cv <- glmnet::cv.glmnet(x, y, alpha=0.5, nfolds=5L,
+                          standardize=TRUE, type.measure='mse')
+  get_coef <- function(lambda) {
+    z <- as.matrix(stats::coef(cv, s=lambda))
+    a <- as.numeric(z[-1L,1L]); names(a) <- rownames(z)[-1L]
+    a[is.finite(a) & abs(a)>1e-10]
+  }
+  b <- get_coef('lambda.1se')
+  if (!length(b)) b <- get_coef('lambda.min')
+  if (!length(b)) {
+    cc <- apply(x,2L,function(z) abs(stats::cor(z,y)))
+    return(names(which.max(cc)))
+  }
+  head(names(sort(abs(b), decreasing=TRUE)), k)
+}
+
+# ------------------------------------------------
+# recipes preprocessing from training set ONLY
+# - SVM: zero-variance filter, then Z-score normalize
+# - RF/XGBoost: zero-variance filter, no scaling needed
+# ------------------------------------------------
+prepare_data <- function(train, other, selected, model) {
+  tr <- data.frame(NNI=train[[TARGET]], train[,selected,drop=FALSE], check.names=FALSE)
+  te <- data.frame(NNI=other[[TARGET]], other[,selected,drop=FALSE], check.names=FALSE)
+  rec <- recipes::recipe(NNI ~ ., data=tr) |>
+    recipes::step_zv(recipes::all_predictors())
+  if (model=='SVM') {
+    rec <- rec |> recipes::step_normalize(recipes::all_predictors())
+  }
+  baked <- recipes::prep(rec, training=tr, retain=TRUE)
+  tr2 <- recipes::bake(baked, new_data=tr)
+  te2 <- recipes::bake(baked, new_data=te)
+  vars <- setdiff(names(tr2),'NNI')
+  if (!length(vars)) stop('All selected predictors eliminated by preprocessing')
+  list(xtr=tr2[,vars,drop=FALSE], ytr=tr2$NNI,
+       xte=te2[,vars,drop=FALSE], vars=vars)
+}
+
+# ------------------------------------------------
+# Candidate grids; compact for small sample sizes
+# ------------------------------------------------
+grid_for <- function(model, p) {
+  if (model=='SVM')
+    return(expand.grid(cost=c(0.5,2,8), rbf_sigma=c(0.01,0.1),
+                       KEEP.OUT.ATTRS=FALSE))
+  if (model=='Random_Forest')
+    return(expand.grid(mtry=unique(pmax(1L,pmin(p,c(1L, floor(sqrt(p)),p)))),
+                       min_n=c(3L,5L),KEEP.OUT.ATTRS=FALSE))
+  if (model=='XGBoost')
+    return(expand.grid(trees=c(50L,100L),tree_depth=c(1L,2L),
+                       learn_rate=c(0.05,0.1),KEEP.OUT.ATTRS=FALSE))
+  stop('Unknown model')
+}
+
+make_spec <- function(model, pars, p) {
+  if (model=='SVM')
+    return(parsnip::svm_rbf(mode='regression', cost=pars$cost,
+                            rbf_sigma=pars$rbf_sigma, margin=0.1) |>
+             parsnip::set_engine('kernlab'))
+  if (model=='Random_Forest')
+    return(parsnip::rand_forest(mode='regression', mtry=min(as.integer(pars$mtry),p),
+                                min_n=as.integer(pars$min_n), trees=RF_TREES) |>
+             parsnip::set_engine('ranger', num.threads=1L, seed=SEED))
+  if (model=='XGBoost')
+    return(parsnip::boost_tree(mode='regression',
+                     trees=as.integer(pars$trees),
+                     tree_depth=as.integer(pars$tree_depth),
+                     learn_rate=pars$learn_rate, min_n=2L,
+                     mtry=p, loss_reduction=0,
+                     sample_size=0.8) |>
+             parsnip::set_engine('xgboost', nthread=1L, verbose=0))
+  stop('Unknown model')
+}
+
+# ------------------------------------------------
+# Fit a candidate and predict using fresh recipe
+# ------------------------------------------------
+fit_predict <- function(train, test, selected, model, pars, seed) {
+  set.seed(seed)
+  pr <- prepare_data(train, test, selected, model)
+  spec <- make_spec(model, pars, ncol(pr$xtr))
+  fit <- parsnip::fit_xy(spec, x=pr$xtr, y=pr$ytr)
+  ptr <- as.numeric(stats::predict(fit, new_data=pr$xtr)$.pred)
+  pte <- as.numeric(stats::predict(fit, new_data=pr$xte)$.pred)
+  if (any(!is.finite(c(ptr,pte)))) stop('Nonfinite predictions')
+  list(train=ptr, test=pte, actual_train=pr$ytr, fit=fit)
+}
+
+# ------------------------------------------------
+# Inner CV: reselect bands on EACH inner training fold
+# ------------------------------------------------
+tune_model <- function(outer_train, model, outer_seed) {
+  set.seed(outer_seed)
+  folds <- rsample::vfold_cv(outer_train, v=INNER_V)
+  # Precompute selected bands once per inner fold, not per candidate.
+  inner <- lapply(seq_len(nrow(folds)), function(j) {
+    a <- rsample::analysis(folds$splits[[j]])
+    b <- rsample::assessment(folds$splits[[j]])
+    sel <- select_bands(a, seed=outer_seed+100L+j)
+    list(train=a, test=b, selected=sel)
+  })
+  # Tune on a consistent grid across inner folds; RF mtry bounded per fit.
+  min_p <- min(vapply(inner, function(z) length(z$selected), integer(1)))
+  grid <- grid_for(model, min_p)
+  scores <- rep(NA_real_,nrow(grid))
+  for (g in seq_len(nrow(grid))) {
+    errors <- numeric(0)
+    for (j in seq_along(inner)) {
+      z <- inner[[j]]
+      fp <- fit_predict(z$train,z$test,z$selected,model,grid[g,,drop=FALSE],
+                        seed=outer_seed+10000L+g*100L+j)
+      errors <- c(errors,fp$test-z$test[[TARGET]])
+    }
+    scores[g] <- sqrt(mean(errors^2))
+  }
+  winning <- which.min(scores)
+  list(best=grid[winning,,drop=FALSE], tuning_rmse=scores[winning],
+       grid=cbind(grid, inner_RMSE=scores))
+}
+
+# ------------------------------------------------
+# Run outer LOOCV separately for each development group
+# ------------------------------------------------
+run_group <- function(gr, group_index) {
+  d <- df[df$group==gr,,drop=FALSE]
+  d <- d[stats::complete.cases(d[,c(TARGET,bands),drop=FALSE]),,drop=FALSE]
+  rownames(d) <- NULL
+  if (nrow(d)<12L) stop('Not enough observations in group: ',gr)
+  pred <- list(); train_scores <- list(); chosen <- list(); tunes <- list()
+  models <- c('SVM','Random_Forest','XGBoost')
+  for (i in seq_len(nrow(d))) {
+    outer_seed <- SEED+100000L*group_index+i
+    train <- d[-i,,drop=FALSE]
+    test <- d[i,,drop=FALSE]
+    # Outer feature selection uses outer training set ONLY.
+    outer_bands <- select_bands(train, seed=outer_seed)
+    chosen[[i]] <- data.frame(group=gr, fold=i, band=outer_bands,
+                              rank=seq_along(outer_bands))
+    for (m in models) {
+      # Full nested inner evaluation: independent band selection per inner fold.
+      tuned <- tune_model(train,m,outer_seed)
+      final <- fit_predict(train,test,outer_bands,m,tuned$best,
+                           seed=outer_seed+50000L)
+      pred[[length(pred)+1L]] <- data.frame(
+        group=gr,fold=i,model=m,observed=test[[TARGET]],
+        predicted=final$test,n_bands=length(outer_bands))
+      train_scores[[length(train_scores)+1L]] <- data.frame(
+        group=gr,fold=i,model=m,n_bands=length(outer_bands),
+        metrics(final$actual_train,final$train))
+      best_values <- unlist(tuned$best,use.names=TRUE)
+      tunes[[length(tunes)+1L]] <- data.frame(
+        group=gr,fold=i,model=m,parameter=c(names(best_values),'inner_RMSE'),
+        value=as.character(c(unname(best_values),tuned$tuning_rmse)))
+    }
+    if (i %% 10L == 0L || i == nrow(d))
+      message(gr,' - ',i,'/',nrow(d),' outer folds complete')
+  }
+  list(predictions=dplyr::bind_rows(pred),
+       train_metrics=dplyr::bind_rows(train_scores),
+       bands=dplyr::bind_rows(chosen),
+       tuning=dplyr::bind_rows(tunes))
+}
+
+# ------------------------------------------------
+# Execute, saving each completed group
+# ------------------------------------------------
+results <- vector('list',length(GROUPS_TO_RUN))
+names(results) <- GROUPS_TO_RUN
+for (j in seq_along(GROUPS_TO_RUN)) {
+  gr <- GROUPS_TO_RUN[j]
+  message('Starting group: ',gr)
+  results[[j]] <- run_group(gr,j)
+  saveRDS(results[[j]], file.path(OUTPUT_DIR,
+               paste0('group_',gsub('[^[:alnum:]]+','_',gr),'.rds')))
+}
+
+predictions_long <- dplyr::bind_rows(lapply(results, `[[`,'predictions'))
+training_folds <- dplyr::bind_rows(lapply(results, `[[`,'train_metrics'))
+selected_bands_cv <- dplyr::bind_rows(lapply(results, `[[`,'bands'))
+tuning_results <- dplyr::bind_rows(lapply(results, `[[`,'tuning'))
+
+test_metrics <- predictions_long |>
+  dplyr::group_by(group,model) |>
+  dplyr::group_modify(~metrics(.x$observed,.x$predicted)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(dataset='Test')
+train_metrics <- training_folds |>
+  dplyr::group_by(group,model) |>
+  dplyr::summarise(dplyr::across(c(R2,RMSE,MAE,Bias,RPD,RPIQ,nRMSE),
+                                 ~mean(.x,na.rm=TRUE)),.groups='drop') |>
+  dplyr::mutate(dataset='Train')
+model_performance <- dplyr::bind_rows(train_metrics,test_metrics) |>
+  tidyr::pivot_wider(names_from=dataset,
+                     values_from=c(R2,RMSE,MAE,Bias,RPD,RPIQ,nRMSE),
+                     names_glue='{.value}_{dataset}') |>
+  dplyr::arrange(group,RMSE_Test)
+
+best_models <- model_performance |>
+  dplyr::group_by(group) |>
+  dplyr::slice_min(RMSE_Test,n=1,with_ties=FALSE) |>
+  dplyr::ungroup()
+
+band_frequency <- selected_bands_cv |>
+  dplyr::count(group,band,name='selected_n') |>
+  dplyr::left_join(selected_bands_cv |>
+      dplyr::distinct(group,fold) |>
+      dplyr::count(group,name='n_folds'),by='group') |>
+  dplyr::mutate(frequency_pct=100*selected_n/n_folds) |>
+  dplyr::arrange(group,dplyr::desc(frequency_pct))
+
+# All three algorithms use the Elastic Net-selected band set in each fold.
+best_model_bands <- best_models |>
+  dplyr::select(group,model,RMSE_Test,R2_Test) |>
+  dplyr::left_join(band_frequency,by='group') |>
+  dplyr::arrange(group,dplyr::desc(frequency_pct))
+
+outputs <- list(
+  NNI_LOOCV_predictions=predictions_long,
+  NNI_training_fold_metrics=training_folds,
+  NNI_selected_bands_CV=selected_bands_cv,
+  NNI_grid_search_results=tuning_results,
+  NNI_model_performance=model_performance,
+  NNI_best_models=best_models,
+  NNI_band_selection_frequency=band_frequency,
+  NNI_best_model_bands=best_model_bands
+)
+for (nm in names(outputs))
+  readr::write_csv(outputs[[nm]],file.path(OUTPUT_DIR,paste0(nm,'.csv')))
+
+p1 <- ggplot2::ggplot(predictions_long,ggplot2::aes(observed,predicted)) +
+  ggplot2::geom_point(alpha=.7,size=1.5) +
+  ggplot2::geom_abline(intercept=0,slope=1,linetype='dashed',color='red') +
+  ggplot2::facet_grid(group~model,scales='free') +
+  ggplot2::labs(x='Observed NNI',y='LOOCV predicted NNI') +
+  ggplot2::theme_bw()
+ggplot2::ggsave(file.path(OUTPUT_DIR,'NNI_observed_vs_predicted.png'),
+                p1,width=12,height=9,dpi=300)
+p2 <- ggplot2::ggplot(model_performance,ggplot2::aes(model,RMSE_Test)) +
+  ggplot2::geom_col(fill='#31688e') +
+  ggplot2::facet_wrap(~group,scales='free_y') +
+  ggplot2::labs(x='Model',y='LOOCV RMSE') +
+  ggplot2::theme_classic()
+ggplot2::ggsave(file.path(OUTPUT_DIR,'NNI_model_RMSE.png'),
+                p2,width=10,height=5,dpi=300)
+
+print(model_performance,n=Inf)
+print(best_models,n=Inf)
+message('Done. Outputs in ',normalizePath(OUTPUT_DIR))
+
+```
+

@@ -1,0 +1,195 @@
+---
+title: "final_tentative"
+author: "Matheus Ardigueri"
+date: "2026-10-23"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(tidymodels)
+library(tidyr)
+library(ggplot2)
+
+df_all <- read_excel("./data/thiago2024/Corn_all.xlsx")
+
+df_all
+
+```
+
+# Band filtering
+
+```{r}
+
+
+df_filtered <- df_all %>%
+  select(
+    -starts_with("Band_"),
+    Band_5:Band_293
+  )
+
+df_filtered
+```
+
+# Pivot longer
+
+```{r}
+df_pivot <- df_filtered %>%
+  pivot_longer(cols = 8:296,
+               names_to = "bands",
+               values_to = "values")
+
+df_pivot
+
+df_pivot2 <- df_pivot %>%
+  pivot_longer(cols = 4:7,
+               names_to = "physiological",
+               values_to = "phys_values")
+df_pivot2
+
+df_phys <- df_pivot2 %>%
+  distinct(
+    N_treatmen,
+    DAP,
+    ID,
+    physiological,
+    phys_values
+  )
+```
+
+```{r}
+
+ggplot(df_phys,
+       aes(x = factor(N_treatmen),
+           y = phys_values,
+           fill = factor(N_treatmen))) +
+  geom_boxplot(
+    outlier.color = "red",
+    outlier.size = 1.5
+  ) +
+  facet_grid(
+    physiological ~ DAP,
+    scales = "free_y"
+  ) +
+  scale_fill_viridis_d(option = "E") +
+  labs(
+    x = "Nitrogen Treatment",
+    y = "Physiological Value",
+    fill = "N Treatment"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+
+# Removing outliers using IQR method
+
+```{r}
+
+# Remove outliers using the IQR method
+df_phys_clean <- df_phys %>%
+  group_by(physiological, DAP, N_treatmen) %>%
+  mutate(
+    Q1 = quantile(phys_values, 0.25, na.rm = TRUE),
+    Q3 = quantile(phys_values, 0.75, na.rm = TRUE),
+    IQR_value = IQR(phys_values, na.rm = TRUE),
+    lower = Q1 - 1.5 * IQR_value,
+    upper = Q3 + 1.5 * IQR_value
+  ) %>%
+  filter(
+    phys_values >= lower,
+    phys_values <= upper
+  ) %>%
+  ungroup() %>%
+  select(-Q1, -Q3, -IQR_value, -lower, -upper)
+
+df_phys_clean
+```
+```{r}
+# Original observations
+nrow(df_phys)
+
+# Observations after filtering
+nrow(df_phys_clean)
+
+# Total removed
+nrow(df_phys) - nrow(df_phys_clean)
+```
+```{r}
+ggplot(df_phys_clean,
+       aes(x = factor(N_treatmen),
+           y = phys_values,
+           fill = factor(N_treatmen))) +
+  geom_boxplot(
+    outlier.color = "red",
+    outlier.size = 1.5
+  ) +
+  facet_grid(
+    physiological ~ DAP,
+    scales = "free_y"
+  ) +
+  scale_fill_viridis_d(option = "E") +
+  labs(
+    x = "Nitrogen Treatment",
+    y = "Physiological Value",
+    fill = "N Treatment"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+
+# Filtering for negative GSW values.
+
+```{r}
+df_phys_clean <- df_phys_clean %>%
+  filter(
+    !grepl("^gsw", physiological, ignore.case = TRUE) |
+      phys_values >= 0
+  )
+```
+
+```{r}
+df_phys_clean %>%
+  filter(
+    grepl("^gsw", physiological, ignore.case = TRUE),
+    phys_values < 0
+  )
+```
+```{r}
+ggplot(df_phys_clean,
+       aes(x = factor(N_treatmen),
+           y = phys_values,
+           fill = factor(N_treatmen))) +
+  geom_boxplot(width = 0.7) +
+  facet_grid(
+    physiological ~ DAP,
+    scales = "free_y",
+    switch = "y"
+  ) +
+  scale_fill_manual(values = c("#0b2c6b", "gray50", "#e6d91c")) +
+  labs(
+    x = "Nitrogen Treatment",
+    y = "Physiological Value"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "white", color = "black"),
+    strip.text = element_text(face = "bold", color = "black"),
+    panel.grid = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black")
+  )
+```
+```{r}
+df_phys_clean %>%
+  filter(grepl("^gsw", physiological, ignore.case = TRUE)) %>%
+  summarise(min_gsw = min(phys_values, na.rm = TRUE))
+```
+

@@ -1,0 +1,823 @@
+---
+title: "Corn_n_calculations"
+author: "Matheus Ardigueri"
+date: "2026-10-23"
+output: html_document
+---
+
+# Loading Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidymodels)
+library(tidyverse)
+library(janitor)
+library(glmnet)
+library(randomForest)
+library(ranger)
+library(ggplot2)
+library(caret)
+library(pls)
+library(viridis)
+```
+
+
+# Loading dataset
+
+```{r}
+df_corn_n_calculations <- read_excel("./data/thiago2024/Corn_N_calculations.xlsx", sheet = "R6 Combined_real")
+df_corn_n_calculations
+
+```
+
+```{r}
+df_filtered <- df_corn_n_calculations %>%
+  select(
+    -starts_with("Band_"),
+    Band_5:Band_293
+  )
+
+df_filtered
+```
+
+```{r}
+df_clean_names <- df_filtered %>%
+  clean_names()
+df_clean_names
+
+```
+
+```{r}
+write_csv(df_clean_names, "./output/df_clean_names.csv")
+```
+
+# First Exploratory Data Analysis
+
+```{r}
+
+# Identify spectral bands
+bands <- names(df_clean_names) %>%
+  str_subset("^band_\\d+$")
+
+# Target variable
+target <- "r6_nni_combined"
+
+# Prepare dataset
+df_eda <- df_clean_names %>%
+  mutate(
+    year = factor(year),
+    stage = factor(stage,
+                   levels = c("V8", "R1", "R2", "R5", "R6")),
+    n_treatment = factor(n_treatment),
+    study_field = factor(study_field),
+    date = as.Date(date)
+  )
+
+# Separate by growth stage
+stage_data <- split(df_eda, df_eda$stage)
+
+# Example: access R1 dataset
+df_r1 <- stage_data[["R1"]]
+```
+
+
+# Summarize NNI across crop stages
+
+```{r}
+nni_summary <- df_eda %>%
+  group_by(stage) %>%
+  summarise(
+    n = sum(!is.na(r6_nni_combined)),
+    mean = mean(r6_nni_combined, na.rm = TRUE),
+    sd = sd(r6_nni_combined, na.rm = TRUE),
+    median = median(r6_nni_combined, na.rm = TRUE),
+    minimum = min(r6_nni_combined, na.rm = TRUE),
+    maximum = max(r6_nni_combined, na.rm = TRUE),
+    cv = 100 * sd / mean,
+    .groups = "drop"
+  )
+
+print(nni_summary)
+```
+
+# NNI distributions
+
+```{r}
+# Histogram for each stage
+ggplot(df_eda,
+       aes(x = r6_nni_combined)) +
+  geom_histogram(
+    bins = 12,
+    fill = "#31688e",
+    color = "black",
+    alpha = 0.85
+  ) +
+  facet_wrap(~ stage, scales = "free_y") +
+  labs(
+    x = "Nitrogen Nutrition Index (NNI)",
+    y = "Frequency"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+```
+
+# NNI differences among nitrogen treatments
+
+```{r}
+ggplot(df_eda,
+       aes(x = n_treatment,
+           y = r6_nni_combined,
+           fill = n_treatment)) +
+  geom_boxplot(
+    width = 0.65,
+    alpha = 0.85
+  ) +
+  facet_wrap(~ stage, scales = "free_y") +
+  scale_fill_viridis_d(option = "E") +
+  labs(
+    x = "Nitrogen Treatment",
+    y = "Nitrogen Nutrition Index (NNI)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+```
+
+# Examine mean hyperspectral signatures
+
+```{r}
+spectral_long <- df_eda %>%
+  select(stage, n_treatment, all_of(bands)) %>%
+  pivot_longer(
+    cols = all_of(bands),
+    names_to = "band",
+    values_to = "reflectance"
+  ) %>%
+  mutate(
+    band_number = as.numeric(
+      str_remove(band, "band_")
+    )
+  )
+
+# Mean reflectance by stage and treatment
+spectral_summary <- spectral_long %>%
+  group_by(stage, n_treatment, band_number) %>%
+  summarise(
+    mean_reflectance = mean(reflectance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(spectral_summary,
+       aes(x = band_number,
+           y = mean_reflectance,
+           color = n_treatment)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ stage, scales = "free_y") +
+  scale_color_viridis_d(option = "E") +
+  labs(
+    x = "Spectral Band Number",
+    y = "Mean Reflectance",
+    color = "N Treatment"
+  ) +
+  theme_classic(base_size = 14)
+```
+
+# Correlation between NNI and spectral bands
+
+```{r}
+# Correlation analysis by stage
+cor_results <- map_dfr(names(stage_data), function(s) {
+
+  d <- stage_data[[s]]
+
+  map_dfr(bands, function(b) {
+
+    tibble(
+      stage = s,
+      band = b,
+      pearson = cor(
+        d[[b]], d[[target]],
+        method = "pearson",
+        use = "complete.obs"
+      ),
+      spearman = cor(
+        d[[b]], d[[target]],
+        method = "spearman",
+        use = "complete.obs"
+      )
+    )
+  })
+}) %>%
+  mutate(
+    band_number = as.numeric(str_remove(band, "band_"))
+  )
+
+# Top 10 bands for each stage
+top_bands <- cor_results %>%
+  group_by(stage) %>%
+  slice_max(
+    order_by = abs(pearson),
+    n = 10
+  ) %>%
+  ungroup()
+
+print(top_bands)
+```
+
+
+## Plot the correlations
+
+```{r}
+ggplot(cor_results,
+       aes(x = band_number, y = pearson)) +
+  geom_line(
+    color = "#31688e",
+    linewidth = 1
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  facet_wrap(~ stage) +
+  labs(
+    x = "Spectral Band Number",
+    y = "Pearson Correlation with NNI"
+  ) +
+  theme_classic(base_size = 14)
+```
+
+# Feature selection using Elastic Net
+
+```{r}
+
+
+# Exploratory Elastic Net feature selection
+selected_bands <- map_dfr(names(stage_data), function(s) {
+
+  d <- stage_data[[s]] %>%
+    drop_na(all_of(target))
+
+  x <- as.matrix(d[, bands])
+  y <- d[[target]]
+
+  # Inner cross-validation for lambda selection
+  set.seed(123)
+
+  fit <- cv.glmnet(
+    x, y,
+    alpha = 0.5,
+    nfolds = 5,
+    standardize = TRUE
+  )
+
+  coefs <- as.matrix(
+    coef(fit, s = "lambda.1se")
+  )
+
+  tibble(
+    stage = s,
+    band = rownames(coefs),
+    coefficient = as.numeric(coefs[, 1])
+  ) %>%
+    filter(
+      band != "(Intercept)",
+      coefficient != 0
+    )
+})
+
+print(selected_bands)
+```
+
+# Develop NNI prediction E_net models with LOOCV
+
+```{r}
+
+# Function for stage-specific LOOCV
+run_loocv <- function(data, stage_name, alpha = 0.5) {
+
+  d <- data %>%
+    filter(!is.na(.data[[target]])) %>%
+    select(all_of(c(target, bands))) %>%
+    drop_na()
+
+  x <- as.matrix(d[, bands])
+  y <- d[[target]]
+
+  n <- length(y)
+  predictions <- numeric(n)
+
+  # Outer LOOCV
+  for (i in seq_len(n)) {
+
+    x_train <- x[-i, , drop = FALSE]
+    y_train <- y[-i]
+
+    x_test <- x[i, , drop = FALSE]
+
+    # Inner CV for hyperparameter selection
+    set.seed(123 + i)
+
+    fit <- cv.glmnet(
+      x_train,
+      y_train,
+      alpha = alpha,
+      nfolds = 5,
+      standardize = TRUE
+    )
+
+    predictions[i] <- as.numeric(
+      predict(
+        fit,
+        newx = x_test,
+        s = "lambda.min"
+      )
+    )
+  }
+
+  tibble(
+    stage = stage_name,
+    observed = y,
+    predicted = predictions
+  )
+}
+
+# Run independent models for each crop stage
+loocv_results <- map_dfr(
+  names(stage_data),
+  function(s) {
+    run_loocv(stage_data[[s]], s)
+  }
+)
+```
+
+# Model Evaluations
+
+```{r}
+model_metrics <- loocv_results %>%
+  group_by(stage) %>%
+  summarise(
+    n = n(),
+
+    R2 = 1 - sum((observed - predicted)^2) /
+      sum((observed - mean(observed))^2),
+
+    RMSE = sqrt(mean((observed - predicted)^2)),
+
+    MAE = mean(abs(observed - predicted)),
+
+    Bias = mean(predicted - observed),
+
+    RPD = sd(observed) /
+      sqrt(mean((observed - predicted)^2)),
+
+    RPIQ = IQR(observed) /
+      sqrt(mean((observed - predicted)^2)),
+
+    .groups = "drop"
+  )
+
+print(model_metrics)
+```
+
+```{r}
+ggplot(loocv_results,
+       aes(x = observed, y = predicted)) +
+  geom_point(
+    color = "#31688e",
+    size = 2.5,
+    alpha = 0.8
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "red",
+    linewidth = 0.9
+  ) +
+  facet_wrap(~ stage, scales = "free") +
+  labs(
+    x = "Observed NNI",
+    y = "Predicted NNI"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+```
+
+```{r}
+loocv_results %>%
+  mutate(
+    residual = observed - predicted
+  ) %>%
+  ggplot(aes(x = predicted, y = residual)) +
+  geom_point(color = "#31688e", size = 2.5) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  facet_wrap(~ stage, scales = "free") +
+  labs(
+    x = "Predicted NNI",
+    y = "Residual (Observed - Predicted)"
+  ) +
+  theme_classic(base_size = 14)
+```
+
+# For all models set the seed
+
+```{r}
+# Reproducibility
+set.seed(123)
+
+# Avoid parallel-related reproducibility differences
+options(mc.cores = 1)
+
+# Import dataset
+df <- df_clean_names
+# Identify hyperspectral bands
+bands <- names(df) %>%
+  str_subset("^band_\\d+$")
+
+# Response variable
+target <- "r6_nni_combined"
+
+# Define stages
+stages <- c("V8", "R1", "R2", "R5", "R6")
+
+# Prepare data
+df <- df %>%
+  mutate(
+    stage = factor(stage, levels = stages)
+  )
+
+stage_data <- split(df, df$stage)
+```
+
+
+```{r}
+# Select bands for MLR without using test observations
+select_mlr_bands <- function(x, y, k = 3) {
+
+  correlations <- apply(
+    x, 2,
+    function(z) suppressWarnings(
+      cor(z, y, use = "complete.obs")
+    )
+  )
+
+  ranked <- names(sort(
+    abs(correlations),
+    decreasing = TRUE,
+    na.last = NA
+  ))
+
+  selected <- character(0)
+
+  for (b in ranked) {
+
+    if (length(selected) == 0) {
+      selected <- b
+    } else {
+
+      cor_with_selected <- abs(
+        cor(x[[b]], x[, selected, drop = FALSE])
+      )
+
+      if (all(is.finite(cor_with_selected)) &&
+          all(cor_with_selected < 0.95)) {
+        selected <- c(selected, b)
+      }
+    }
+
+    if (length(selected) == k) break
+  }
+
+  selected
+}
+
+
+# Run models with outer LOOCV
+run_stage_models <- function(data, stage_name,
+                             stage_index) {
+
+  d <- data %>%
+    select(all_of(c(target, bands))) %>%
+    drop_na()
+
+  x <- d %>% select(all_of(bands))
+  y <- d[[target]]
+
+  n <- nrow(d)
+
+  results <- vector("list", n)
+
+  for (i in seq_len(n)) {
+
+    # Reproducible random state for this iteration
+    set.seed(123 + stage_index * 1000 + i)
+
+    train_index <- setdiff(seq_len(n), i)
+
+    x_train <- x[train_index, , drop = FALSE]
+    x_test  <- x[i, , drop = FALSE]
+
+    y_train <- y[train_index]
+
+    # Internal cross-validation
+    ctrl <- trainControl(
+      method = "cv",
+      number = 5,
+      allowParallel = FALSE
+    )
+
+    # ---------------------------------
+    # Model 1: Multiple Linear Regression
+    # ---------------------------------
+
+    mlr_bands <- select_mlr_bands(
+      x_train, y_train, k = 3
+    )
+
+    mlr_train <- data.frame(
+      NNI = y_train,
+      x_train[, mlr_bands, drop = FALSE]
+    )
+
+    mlr_fit <- lm(NNI ~ ., data = mlr_train)
+
+    pred_mlr <- as.numeric(
+      predict(
+        mlr_fit,
+        newdata = x_test
+      )
+    )
+
+    # ---------------------------------
+    # Model 2: PCR
+    # ---------------------------------
+
+    pcr_grid <- expand.grid(
+      ncomp = 1:min(10, nrow(x_train) - 3)
+    )
+
+    pcr_fit <- train(
+      x = x_train,
+      y = y_train,
+      method = "pcr",
+      preProcess = c("center", "scale"),
+      trControl = ctrl,
+      tuneGrid = pcr_grid,
+      metric = "RMSE"
+    )
+
+    pred_pcr <- as.numeric(
+      predict(pcr_fit, newdata = x_test)
+    )
+
+    # ---------------------------------
+    # Model 3: PLSR
+    # ---------------------------------
+
+    pls_grid <- expand.grid(
+      ncomp = 1:min(10, nrow(x_train) - 3)
+    )
+
+    pls_fit <- train(
+      x = x_train,
+      y = y_train,
+      method = "pls",
+      preProcess = c("center", "scale"),
+      trControl = ctrl,
+      tuneGrid = pls_grid,
+      metric = "RMSE"
+    )
+
+    pred_pls <- as.numeric(
+      predict(pls_fit, newdata = x_test)
+    )
+
+    # ---------------------------------
+    # Model 4: Elastic Net
+    # ---------------------------------
+
+    en_grid <- expand.grid(
+      alpha = c(0.25, 0.5, 0.75, 1),
+      lambda = exp(seq(
+        log(0.001),
+        log(1),
+        length.out = 8
+      ))
+    )
+
+    en_fit <- train(
+      x = x_train,
+      y = y_train,
+      method = "glmnet",
+      preProcess = c("center", "scale"),
+      trControl = ctrl,
+      tuneGrid = en_grid,
+      metric = "RMSE"
+    )
+
+    pred_en <- as.numeric(
+      predict(en_fit, newdata = x_test)
+    )
+
+    # ---------------------------------
+    # Model 5: Random Forest
+    # ---------------------------------
+
+    rf_grid <- expand.grid(
+      mtry = unique(pmin(
+        c(5, 15, 30),
+        ncol(x_train)
+      )),
+      splitrule = "variance",
+      min.node.size = 5
+    )
+
+    rf_fit <- train(
+      x = x_train,
+      y = y_train,
+      method = "ranger",
+      trControl = ctrl,
+      tuneGrid = rf_grid,
+      num.trees = 300,
+      num.threads = 1,
+      importance = "permutation",
+      metric = "RMSE"
+    )
+
+    pred_rf <- as.numeric(
+      predict(rf_fit, newdata = x_test)
+    )
+
+    # ---------------------------------
+    # Store held-out predictions
+    # ---------------------------------
+
+    results[[i]] <- tibble(
+      stage = stage_name,
+      observation = i,
+      observed = y[i],
+      MLR = pred_mlr,
+      PCR = pred_pcr,
+      PLSR = pred_pls,
+      Elastic_Net = pred_en,
+      Random_Forest = pred_rf
+    )
+  }
+
+  bind_rows(results)
+}
+```
+
+```{r}
+set.seed(123)
+
+all_predictions <- map2_dfr(
+  stages,
+  seq_along(stages),
+  function(s, j) {
+
+    message("Running stage: ", s)
+
+    run_stage_models(
+      data = stage_data[[s]],
+      stage_name = s,
+      stage_index = j
+    )
+  }
+)
+
+# Convert to long format
+predictions_long <- all_predictions %>%
+  pivot_longer(
+    cols = c(
+      MLR, PCR, PLSR,
+      Elastic_Net, Random_Forest
+    ),
+    names_to = "model",
+    values_to = "predicted"
+  )
+
+write_csv(
+  predictions_long,
+  "NNI_LOOCV_predictions.csv"
+)
+```
+
+```{r}
+model_performance <- predictions_long %>%
+  group_by(stage, model) %>%
+  summarise(
+    n = n(),
+
+    R2 = 1 -
+      sum((observed - predicted)^2) /
+      sum((observed - mean(observed))^2),
+
+    RMSE = sqrt(
+      mean((observed - predicted)^2)
+    ),
+
+    MAE = mean(
+      abs(observed - predicted)
+    ),
+
+    Bias = mean(
+      predicted - observed
+    ),
+
+    RPD = sd(observed) /
+      sqrt(mean((observed - predicted)^2)),
+
+    RPIQ = IQR(observed) /
+      sqrt(mean((observed - predicted)^2)),
+
+    nRMSE = 100 *
+      sqrt(mean((observed - predicted)^2)) /
+      mean(observed),
+
+    .groups = "drop"
+  ) %>%
+  arrange(stage, RMSE)
+
+print(model_performance)
+
+write_csv(
+  model_performance,
+  "NNI_model_performance.csv"
+)
+```
+
+```{r}
+ggplot(predictions_long,
+       aes(x = observed, y = predicted)) +
+  geom_point(
+    color = "#31688e",
+    size = 1.8,
+    alpha = 0.7
+  ) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  facet_grid(
+    stage ~ model,
+    scales = "free"
+  ) +
+  labs(
+    x = "Observed NNI",
+    y = "Predicted NNI"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+```
+```{r}
+ggplot(model_performance,
+       aes(x = model,
+           y = RMSE,
+           fill = model)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~ stage, scales = "free_y") +
+  scale_fill_viridis_d(option = "E") +
+  labs(
+    x = "Prediction Model",
+    y = "LOOCV RMSE"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    strip.text = element_text(face = "bold")
+  )
+```
+```{r}
+best_models <- model_performance %>%
+  group_by(stage) %>%
+  slice_min(RMSE, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+print(best_models)
+```
+
+

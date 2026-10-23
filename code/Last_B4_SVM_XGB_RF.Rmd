@@ -1,0 +1,322 @@
+---
+title: "Analysis_per_group"
+author: "Matheus Ardigueri"
+date: "2026-10-23"
+output: html_document
+---
+
+```{r}
+required <- c('readr','dplyr','tidyr','purrr','stringr','ggplot2',
+              'caret','glmnet','pls','ranger','xgboost')
+missing_packages <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages)) {
+  stop('Please install packages first: install.packages(c(',
+       paste(sprintf('"%s"', missing_packages), collapse = ', '), '))')
+}
+```
+
+```{r}
+set.seed(123)
+setwd(getwd())  # Retains your current RStudio working directory
+input_file <- './output/df_clean_names.csv'
+output_dir <- './output_2'
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+if (!file.exists(input_file)) stop('Cannot find dataset: ', input_file)
+
+df <- readr::read_csv(input_file, show_col_types = FALSE)
+target <- 'r6_nni_combined'
+groups <- c('V8','R1-R2','R5-R6')
+bands <- grep('^band_[0-9]+$', names(df), value = TRUE)
+stopifnot(target %in% names(df), 'group' %in% names(df), length(bands) > 0)
+if (!all(vapply(df[bands], is.numeric, logical(1)))) stop('Spectral bands must be numeric.')
+```
+
+```{r}
+score_metrics <- function(obs, pred) {
+  stopifnot(length(obs) == length(pred), length(obs) >= 2L)
+  if (any(!is.finite(obs)) || any(!is.finite(pred))) stop('Non-finite predictions or observations.')
+  e <- pred - obs
+  rmse <- sqrt(mean(e^2))
+  sst <- sum((obs - mean(obs))^2)
+  c(R2 = if (sst > 0) 1 - sum(e^2)/sst else NA_real_,
+    RMSE = rmse,
+    MAE = mean(abs(e)),
+    Bias = mean(e),
+    RPD = if (rmse > 0) stats::sd(obs)/rmse else NA_real_,
+    RPIQ = if (rmse > 0) stats::IQR(obs)/rmse else NA_real_,
+    nRMSE = if (mean(obs) != 0) 100*rmse/abs(mean(obs)) else NA_real_)
+}
+```
+
+```{r}
+select_bands_en <- function(x, y, seed, max_bands = 5L) {
+  x <- as.matrix(x)
+  sd_x <- apply(x, 2L, stats::sd)
+  usable <- names(sd_x)[is.finite(sd_x) & sd_x > 1e-10]
+  if (length(usable) == 0L) stop('All spectral predictors are constant in a training fold.')
+  x <- x[, usable, drop = FALSE]
+  set.seed(seed)
+  cv <- glmnet::cv.glmnet(x, y, alpha = 0.5,
+                          nfolds = 5, standardize = TRUE,
+                          type.measure = 'mse')
+  extract <- function(s) {
+    m <- as.matrix(stats::coef(cv, s = s))
+    a <- as.numeric(m[-1L, 1L])
+    names(a) <- rownames(m)[-1L]
+    a[is.finite(a) & abs(a) > 1e-10]
+  }
+  betas <- extract('lambda.1se')
+  if (!length(betas)) betas <- extract('lambda.min')
+  if (length(betas)) {
+    chosen <- names(sort(abs(betas), decreasing = TRUE))[seq_len(min(max_bands, length(betas)))]
+  } else {
+    c0 <- apply(x, 2L, function(z) abs(stats::cor(z, y)))
+    chosen <- names(which.max(c0))
+  }
+  chosen
+}
+```
+
+```{r}
+make_ctrl <- function(y, seed) {
+  set.seed(seed)
+  idx <- caret::createFolds(y, k = 5L, returnTrain = TRUE)
+  caret::trainControl(method = 'cv', number = 5L, index = idx,
+                      allowParallel = FALSE, verboseIter = FALSE)
+}
+
+# Safe long-format recording of tuned parameters with mixed numeric/character types.
+tune_rows <- function(group, fold, model, params) {
+  values <- unlist(params, use.names = TRUE)
+  data.frame(group = group, fold = fold, model = model,
+             parameter = names(values), value = as.character(values),
+             stringsAsFactors = FALSE)
+}
+
+run_group_models <- function(group_name, group_index) {
+  d <- df[df$group == group_name, , drop = FALSE]
+  d <- d[stats::complete.cases(d[, c(target,bands), drop = FALSE]), , drop = FALSE]
+  n <- nrow(d)
+  if (n < 12) stop('Not enough complete observations in ', group_name)
+  x <- as.matrix(d[, bands, drop = FALSE]); y <- d[[target]]
+
+  test_rows <- list(); train_rows <- list(); selection_rows <- list(); tune_list <- list()
+  models <- c('MLR','PCR','PLSR','Random_Forest','XGBoost')
+
+  for (i in seq_len(n)) {
+    seed_i <- 123L + 1000L * group_index + i
+    train_ids <- setdiff(seq_len(n), i)
+    ytr <- y[train_ids]; yte <- y[i]
+    xtr_full <- x[train_ids, , drop = FALSE]
+    xte_full <- x[i, , drop = FALSE]
+
+    # 1. Feature selection BEFORE model fitting, inside outer fold.
+    selected <- select_bands_en(xtr_full, ytr, seed_i, max_bands = 5L)
+    xtr <- as.data.frame(xtr_full[, selected, drop = FALSE], check.names = FALSE)
+    xte <- as.data.frame(xte_full[, selected, drop = FALSE], check.names = FALSE)
+    p <- ncol(xtr)
+    selection_rows[[i]] <- data.frame(group = group_name, fold = i, band = selected)
+
+    # 2. Same inner resampling partitions for all five models.
+    ctrl <- make_ctrl(ytr, seed_i)
+
+    # MLR: tune number of selected bands, 1 .. min(3,p).
+    mlr_choices <- seq_len(min(3L, p))
+    mlr_rmse <- rep(Inf, length(mlr_choices))
+    for (j in seq_along(mlr_choices)) {
+      k <- mlr_choices[j]
+      set.seed(seed_i)
+      cv_lm <- caret::train(
+        x = xtr[, seq_len(k), drop = FALSE], y = ytr,
+        method = 'lm', metric = 'RMSE', trControl = ctrl,
+        tuneGrid = data.frame(intercept = TRUE))
+      mlr_rmse[j] <- cv_lm$results$RMSE[1]
+    }
+    if (!any(is.finite(mlr_rmse))) stop('MLR tuning failed in ',group_name,' fold ',i)
+    k_best <- mlr_choices[which.min(mlr_rmse)]
+    mlr_cols <- selected[seq_len(k_best)]
+    mlr_fit <- stats::lm(NNI ~ ., data = data.frame(NNI = ytr, xtr[, mlr_cols, drop = FALSE]))
+    pred_MLR_train <- as.numeric(stats::predict(mlr_fit, newdata = xtr[, mlr_cols, drop = FALSE]))
+    pred_MLR_test  <- as.numeric(stats::predict(mlr_fit, newdata = xte[, mlr_cols, drop = FALSE]))
+
+    # PCR / PLSR: tune component count.
+    component_grid <- data.frame(ncomp = seq_len(min(5L, p, length(ytr) - 2L)))
+    set.seed(seed_i)
+    fit_pcr <- caret::train(x = xtr, y = ytr, method = 'pcr',
+                            preProcess = c('center','scale'),
+                            tuneGrid = component_grid, trControl = ctrl, metric = 'RMSE')
+    set.seed(seed_i)
+    fit_plsr <- caret::train(x = xtr, y = ytr, method = 'pls',
+                             preProcess = c('center','scale'),
+                             tuneGrid = component_grid, trControl = ctrl, metric = 'RMSE')
+
+    # Random Forest: tune mtry and minimum node size.
+    rf_grid <- expand.grid(
+      mtry = sort(unique(pmin(p, c(1L, max(1L, floor(sqrt(p))), p)))),
+      splitrule = 'variance', min.node.size = c(3L, 5L))
+    set.seed(seed_i)
+    fit_rf <- caret::train(x = xtr, y = ytr, method = 'ranger',
+                           tuneGrid = rf_grid, trControl = ctrl, metric = 'RMSE',
+                           num.trees = 300L, num.threads = 1L)
+
+    # XGBoost: compact explicit grid for small group-level sample sizes.
+    xgb_grid <- expand.grid(nrounds = c(50L, 100L),
+                            max_depth = c(1L, 2L),
+                            eta = c(0.05, 0.1),
+                            gamma = 0,
+                            colsample_bytree = 1,
+                            min_child_weight = 1,
+                            subsample = 0.8)
+    set.seed(seed_i)
+    fit_xgb <- caret::train(x = xtr, y = ytr, method = 'xgbTree',
+                            tuneGrid = xgb_grid, trControl = ctrl, metric = 'RMSE',
+                            nthread = 1L, verbose = FALSE)
+
+    train_pred <- list(
+      MLR = pred_MLR_train,
+      PCR = as.numeric(stats::predict(fit_pcr, newdata = xtr)),
+      PLSR = as.numeric(stats::predict(fit_plsr, newdata = xtr)),
+      Random_Forest = as.numeric(stats::predict(fit_rf, newdata = xtr)),
+      XGBoost = as.numeric(stats::predict(fit_xgb, newdata = xtr)))
+    test_pred <- list(
+      MLR = pred_MLR_test,
+      PCR = as.numeric(stats::predict(fit_pcr, newdata = xte)),
+      PLSR = as.numeric(stats::predict(fit_plsr, newdata = xte)),
+      Random_Forest = as.numeric(stats::predict(fit_rf, newdata = xte)),
+      XGBoost = as.numeric(stats::predict(fit_xgb, newdata = xte)))
+
+    for (m in models) {
+      pte <- test_pred[[m]]
+      ptr <- train_pred[[m]]
+      if (length(pte) != 1L || length(ptr) != length(ytr) ||
+          any(!is.finite(c(pte,ptr)))) {
+        stop('Invalid ',m,' prediction at ',group_name,' fold ',i)
+      }
+      test_rows[[length(test_rows) + 1L]] <- data.frame(
+        group = group_name, fold = i, model = m, observed = yte,
+        predicted = pte, n_bands = if (m == 'MLR') k_best else p)
+      met <- score_metrics(ytr, ptr)
+      train_rows[[length(train_rows) + 1L]] <- data.frame(
+        group = group_name, fold = i, model = m,
+        n_bands = if (m == 'MLR') k_best else p,
+        as.list(met), check.names = FALSE)
+    }
+
+    tune_list[[i]] <- dplyr::bind_rows(
+      tune_rows(group_name, i, 'MLR', c(n_bands = k_best)),
+      tune_rows(group_name, i, 'PCR', fit_pcr$bestTune),
+      tune_rows(group_name, i, 'PLSR', fit_plsr$bestTune),
+      tune_rows(group_name, i, 'Random_Forest', fit_rf$bestTune),
+      tune_rows(group_name, i, 'XGBoost', fit_xgb$bestTune))
+
+    if (i %% 10L == 0L || i == n) message(group_name, ': ', i, '/', n, ' folds complete')
+  }
+  list(predictions = dplyr::bind_rows(test_rows),
+       training = dplyr::bind_rows(train_rows),
+       selected_bands = dplyr::bind_rows(selection_rows),
+       tuning = dplyr::bind_rows(tune_list))
+}
+```
+
+```{r}
+set.seed(123)
+results <- vector('list', length(groups)); names(results) <- groups
+for (j in seq_along(groups)) {
+  s <- groups[j]
+  message('STARTING GROUP: ',s)
+  results[[j]] <- run_group_models(s, j)
+  # Save each completed group, so results survive an interrupted R session.
+  saveRDS(results[[j]], file.path(output_dir, paste0('group_',s,'.rds')))
+}
+
+predictions_long <- dplyr::bind_rows(lapply(results, `[[`, 'predictions'))
+training_folds <- dplyr::bind_rows(lapply(results, `[[`, 'training'))
+selected_bands_cv <- dplyr::bind_rows(lapply(results, `[[`, 'selected_bands'))
+tuning_results <- dplyr::bind_rows(lapply(results, `[[`, 'tuning'))
+
+# ----------------------- MODEL METRICS -----------------------
+test_performance <- predictions_long |>
+  dplyr::group_by(group, model) |>
+  dplyr::group_modify(~ as.data.frame(as.list(score_metrics(.x$observed, .x$predicted)))) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(dataset = 'Test')
+train_performance <- training_folds |>
+  dplyr::group_by(group, model) |>
+  dplyr::summarise(dplyr::across(c(R2,RMSE,MAE,Bias,RPD,RPIQ,nRMSE),
+                                  ~ mean(.x, na.rm = TRUE)), .groups = 'drop') |>
+  dplyr::mutate(dataset = 'Train')
+model_performance <- dplyr::bind_rows(train_performance, test_performance) |>
+  tidyr::pivot_wider(names_from = dataset,
+                     values_from = c(R2,RMSE,MAE,Bias,RPD,RPIQ,nRMSE),
+                     names_glue = '{.value}_{dataset}') |>
+  dplyr::arrange(group, RMSE_Test)
+
+band_frequency <- selected_bands_cv |>
+  dplyr::count(group, band, name = 'selected_n') |>
+  dplyr::left_join(predictions_long |>
+                     dplyr::distinct(group, fold) |>
+                     dplyr::count(group, name = 'n_folds'), by = 'group') |>
+  dplyr::mutate(frequency_pct = 100*selected_n/n_folds) |>
+  dplyr::arrange(group, dplyr::desc(frequency_pct))
+
+best_models <- model_performance |>
+  dplyr::group_by(group) |>
+  dplyr::arrange(RMSE_Test, .by_group = TRUE) |>
+  dplyr::slice_head(n = 1) |>
+  dplyr::ungroup()
+
+# Export everything
+readr::write_csv(predictions_long, file.path(output_dir,'NNI_LOOCV_predictions.csv'))
+readr::write_csv(training_folds, file.path(output_dir,'NNI_training_fold_metrics.csv'))
+readr::write_csv(selected_bands_cv, file.path(output_dir,'NNI_selected_bands_CV.csv'))
+readr::write_csv(tuning_results, file.path(output_dir,'NNI_grid_search_results.csv'))
+readr::write_csv(model_performance, file.path(output_dir,'NNI_model_performance.csv'))
+readr::write_csv(band_frequency, file.path(output_dir,'NNI_band_selection_frequency.csv'))
+readr::write_csv(best_models, file.path(output_dir,'NNI_best_models.csv'))
+
+print(model_performance, n = Inf)
+print(best_models, n = Inf)
+
+p1 <- ggplot2::ggplot(predictions_long, ggplot2::aes(observed, predicted)) +
+  ggplot2::geom_point(alpha = 0.7, size = 1.4) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 'dashed', color = 'red') +
+  ggplot2::facet_grid(group ~ model, scales = 'free') +
+  ggplot2::labs(x = 'Observed NNI', y = 'LOOCV predicted NNI') +
+  ggplot2::theme_bw()
+ggplot2::ggsave(file.path(output_dir,'NNI_observed_vs_predicted.png'),
+                p1, width = 14, height = 12, dpi = 300)
+
+p2 <- ggplot2::ggplot(model_performance, ggplot2::aes(model, RMSE_Test)) +
+  ggplot2::geom_col(fill = '#31688e') +
+  ggplot2::facet_wrap(~ group, scales = 'free_y') +
+  ggplot2::labs(x = 'Model', y = 'Outer LOOCV RMSE') +
+  ggplot2::theme_classic() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+ggplot2::ggsave(file.path(output_dir,'NNI_model_RMSE.png'),
+                p2, width = 12, height = 6, dpi = 300)
+
+# Save a filtered report containing only the bands used by the best model per group.
+mlr_k <- tuning_results |>
+  dplyr::filter(model == 'MLR', parameter == 'n_bands') |>
+  dplyr::transmute(group, fold, k = as.integer(value))
+band_ranked <- selected_bands_cv |>
+  dplyr::group_by(group, fold) |>
+  dplyr::mutate(band_rank = dplyr::row_number()) |>
+  dplyr::ungroup()
+best_model_bands <- band_ranked |>
+  dplyr::inner_join(best_models |> dplyr::select(group, model), by = 'group') |>
+  dplyr::left_join(mlr_k, by = c('group','fold')) |>
+  dplyr::filter(model != 'MLR' | band_rank <= k) |>
+  dplyr::group_by(group, model, band) |>
+  dplyr::summarise(times_selected = dplyr::n(), .groups = 'drop') |>
+  dplyr::left_join(predictions_long |>
+                     dplyr::distinct(group, fold) |>
+                     dplyr::count(group, name = 'total_folds'), by = 'group') |>
+  dplyr::mutate(selection_frequency_pct = 100 * times_selected / total_folds) |>
+  dplyr::arrange(group, dplyr::desc(selection_frequency_pct))
+readr::write_csv(best_model_bands,
+                 file.path(output_dir, 'NNI_best_model_bands.csv'))
+
+message('Completed. Results saved to: ', normalizePath(output_dir))
+```
+
