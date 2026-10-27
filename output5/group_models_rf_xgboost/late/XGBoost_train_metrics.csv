@@ -1,0 +1,4 @@
+period,model,dataset,.metric,.estimator,.estimate
+Late,XGBoost,Train,rmse,standard,0.15302022466045717
+Late,XGBoost,Train,rsq,standard,0.9228759795435642
+Late,XGBoost,Train,mae,standard,0.1194759031992754

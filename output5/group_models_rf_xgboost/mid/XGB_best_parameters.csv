@@ -1,0 +1,2 @@
+mtry,trees,min_n,tree_depth,learn_rate,loss_reduction,.config
+3,326,8,5,0.06158482110660261,1,pre0_mod07_post0

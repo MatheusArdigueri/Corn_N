@@ -1,0 +1,13 @@
+period,model,dataset,.metric,.estimator,.estimate,.config
+Early,RF,Train,rmse,standard,0.1316093606762828,NA
+Early,RF,Train,rsq,standard,0.8787590781382805,NA
+Early,RF,Train,mae,standard,0.10080276290173343,NA
+Early,RF,Test,rmse,standard,0.3238013431422184,pre0_mod0_post0
+Early,RF,Test,rsq,standard,0.0453834626657307,pre0_mod0_post0
+Early,RF,Test,mae,standard,0.2736421264373179,pre0_mod0_post0
+Early,XGBoost,Train,rmse,standard,0.06760069564433774,NA
+Early,XGBoost,Train,rsq,standard,0.9561634207847655,NA
+Early,XGBoost,Train,mae,standard,0.027857253887319872,NA
+Early,XGBoost,Test,rmse,standard,0.30357727364788223,pre0_mod0_post0
+Early,XGBoost,Test,rsq,standard,0.19046440664963762,pre0_mod0_post0
+Early,XGBoost,Test,mae,standard,0.26180082710994873,pre0_mod0_post0

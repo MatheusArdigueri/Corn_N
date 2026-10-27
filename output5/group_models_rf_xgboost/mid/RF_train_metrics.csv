@@ -1,0 +1,4 @@
+period,model,dataset,.metric,.estimator,.estimate
+Mid,RF,Train,rmse,standard,0.1942398964926815
+Mid,RF,Train,rsq,standard,0.8792822064898893
+Mid,RF,Train,mae,standard,0.16323353225773793

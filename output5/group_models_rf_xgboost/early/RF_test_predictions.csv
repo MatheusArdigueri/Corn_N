@@ -1,0 +1,15 @@
+.pred,id,r6_nni_combined,.row,.config,period,model
+1.0123662197079029,train/test split,0.802699843598994,1,pre0_mod0_post0,Early,RF
+1.0106549192159529,train/test split,1.13402975431464,2,pre0_mod0_post0,Early,RF
+1.1568306385586238,train/test split,1.54932179683232,3,pre0_mod0_post0,Early,RF
+1.234135308000805,train/test split,1.5940431998426,4,pre0_mod0_post0,Early,RF
+1.0738226502963804,train/test split,1.34703317124223,5,pre0_mod0_post0,Early,RF
+1.0019596717476027,train/test split,0.957758982356449,6,pre0_mod0_post0,Early,RF
+1.3676010826001275,train/test split,1.2929522950114,7,pre0_mod0_post0,Early,RF
+1.1255057626397356,train/test split,0.72952868114527,11,pre0_mod0_post0,Early,RF
+1.4690333736683843,train/test split,1.33205162518556,24,pre0_mod0_post0,Early,RF
+1.541015860679206,train/test split,0.847104357764105,27,pre0_mod0_post0,Early,RF
+1.3344530198825781,train/test split,1.25674656552997,34,pre0_mod0_post0,Early,RF
+1.3687230217779363,train/test split,1.02125780293827,35,pre0_mod0_post0,Early,RF
+1.6632107059988808,train/test split,1.39332064850038,39,pre0_mod0_post0,Early,RF
+1.2649805347398386,train/test split,0.833423087449372,45,pre0_mod0_post0,Early,RF

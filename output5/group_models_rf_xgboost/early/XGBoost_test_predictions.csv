@@ -1,0 +1,15 @@
+.pred,id,r6_nni_combined,.row,.config,period,model
+0.9729751944541931,train/test split,0.802699843598994,1,pre0_mod0_post0,Early,XGBoost
+0.9729751944541931,train/test split,1.13402975431464,2,pre0_mod0_post0,Early,XGBoost
+1.290276050567627,train/test split,1.54932179683232,3,pre0_mod0_post0,Early,XGBoost
+1.2607622146606445,train/test split,1.5940431998426,4,pre0_mod0_post0,Early,XGBoost
+1.089759349822998,train/test split,1.34703317124223,5,pre0_mod0_post0,Early,XGBoost
+0.9729751944541931,train/test split,0.957758982356449,6,pre0_mod0_post0,Early,XGBoost
+1.413028597831726,train/test split,1.2929522950114,7,pre0_mod0_post0,Early,XGBoost
+1.0004854202270508,train/test split,0.72952868114527,11,pre0_mod0_post0,Early,XGBoost
+1.4889075756072998,train/test split,1.33205162518556,24,pre0_mod0_post0,Early,XGBoost
+1.3752903938293457,train/test split,0.847104357764105,27,pre0_mod0_post0,Early,XGBoost
+1.3345592021942139,train/test split,1.25674656552997,34,pre0_mod0_post0,Early,XGBoost
+1.3614864349365234,train/test split,1.02125780293827,35,pre0_mod0_post0,Early,XGBoost
+1.9139676094055176,train/test split,1.39332064850038,39,pre0_mod0_post0,Early,XGBoost
+1.2877247333526611,train/test split,0.833423087449372,45,pre0_mod0_post0,Early,XGBoost

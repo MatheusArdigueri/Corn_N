@@ -1,0 +1,657 @@
+---
+title: "Corn NNI Prediction: Early, Mid, and Late Growth Periods"
+subtitle: "Elastic Net band selection | Random Forest and XGBoost"
+author: "Corn nitrogen hyperspectral modeling"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Objective and design
+
+Predict `r6_nni_combined` separately for **Early (V8)**, **Mid (R1–R2)**, and **Late (R5–R6)** using hyperspectral reflectance. Within each period we split experimental units into approximately 70% training and 30% testing; choose bands using Elastic Net on training observations alone; tune **Random Forest** and **XGBoost** using the *same* training folds; then evaluate both on the *same* held-out rows.
+
+**Interpretation:** the response remains `r6_nni_combined` for all three periods. Check whether this is a final-season target versus a stage-specific measurement before calling the earlier-stage models *forecasts*. Early/mid/late also differ in study/year composition, so do not attribute all performance differences solely to crop growth stage.
+
+**Validation caveat:** Elastic Net is fitted on the full training partition *before* the RF/XGBoost tuning folds. Thus the final 30% held-out evaluations remain unseen, but the internal tuning CV metrics may be optimistic because feature selection was not nested within those folds. For publication-grade internal CV estimates, nest feature selection in each resample. Grouped sampling prevents a repeated unit from appearing in both splits/folds; it does not guarantee transfer across fields or years.
+
+# 1. Libraries and configuration
+
+```{r setup}
+# install.packages(c("tidymodels", "tidyverse", "glmnet", "ranger", "xgboost", "finetune", "vip"))
+library(tidymodels)
+library(tidyverse)
+library(glmnet)
+library(ranger)
+library(xgboost)
+library(finetune)
+library(vip)
+
+set.seed(931735)
+
+# Adjust path if your CSV is elsewhere.
+data_file <- "../output/corn_clear_bands.csv"
+output_dir <- "../output5/group_models_rf_xgboost"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Change these to manage processing time.
+rf_iterations <- 50L
+xgb_grid_size <- 20L
+n_cv_folds <- 5L
+elastic_net_alpha <- 0.5
+```
+
+# 2. Load filtered corn data and define stages
+
+```{r read-data}
+corn_raw <- readr::read_csv(data_file, show_col_types = FALSE) %>%
+  select(-any_of(c("...1", "X", "Unnamed: 0"))) %>%
+  mutate(
+    period = case_when(
+      group == "V8" ~ "Early",
+      group == "R1-R2" ~ "Mid",
+      group == "R5-R6" ~ "Late",
+      TRUE ~ NA_character_
+    ),
+    # Repeated observations from the same experimental unit must stay together.
+    unit_id = paste(year, study_field, id, sep = "__")
+  )
+
+band_columns <- names(corn_raw) %>%
+  stringr::str_subset("^band_[0-9]+$")
+
+stopifnot(length(band_columns) > 0)
+
+corn_raw %>%
+  count(period, year, study_field, name = "observations") %>%
+  print(n = Inf)
+```
+
+# 3. Workflow functions
+
+## 3a. Helpers for evaluation and figures
+
+```{r helpers}
+score_predictions <- function(predictions, period_name, model_name, dataset) {
+  metric_set(rmse, rsq, mae)(
+    predictions, truth = r6_nni_combined, estimate = .pred
+  ) %>%
+    mutate(period = period_name, model = model_name, dataset = dataset) %>%
+    select(period, model, dataset, everything())
+}
+
+save_pred_plot <- function(predictions, period_name, model_name, out_folder) {
+  p <- ggplot(predictions, aes(x = r6_nni_combined, y = .pred)) +
+    geom_point(alpha = 0.75) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    geom_smooth(method = "lm", se = FALSE) +
+    coord_equal() +
+    theme_bw() +
+    labs(title = paste(period_name, "—", model_name, "(held-out test)"),
+         x = "Observed R6 NNI combined", y = "Predicted NNI")
+  ggsave(file.path(out_folder, paste0(model_name, "_predicted_vs_observed.png")),
+         p, width = 7, height = 5, dpi = 300)
+  p
+}
+```
+
+## 3b. One period: split, Elastic Net, RF, XGBoost, validation
+
+```{r workflow-function}
+fit_one_period <- function(period_name,
+                           alpha = elastic_net_alpha,
+                           rf_iter = rf_iterations,
+                           xgb_candidates = xgb_grid_size) {
+
+  cat("\n================", period_name, "================\n")
+  out <- file.path(output_dir, tolower(period_name))
+  dir.create(out, recursive = TRUE, showWarnings = FALSE)
+
+  # Keep only the outcome and hyperspectral predictors for modeling.
+  # unit_id is used ONLY to construct grouped resamples (not as a predictor).
+  period_data <- corn_raw %>%
+    filter(period == period_name, is.finite(r6_nni_combined)) %>%
+    select(unit_id, r6_nni_combined, all_of(band_columns)) %>%
+    mutate(across(all_of(band_columns), as.numeric)) %>%
+    filter(if_all(all_of(band_columns), is.finite))
+
+  if (nrow(period_data) < 20 || n_distinct(period_data$unit_id) < 12) {
+    stop("Not enough observations / independent experimental units in ", period_name)
+  }
+
+  # (1) Split BEFORE feature selection.
+  set.seed(931735)
+  corn_split <- rsample::group_initial_split(
+    period_data, group = unit_id, prop = 0.7
+  )
+  corn_train <- training(corn_split)
+  corn_test <- testing(corn_split)
+  cat("Training:", nrow(corn_train), "rows; test:", nrow(corn_test), "rows\n")
+
+  # Keep groups together in both inner resampling and Elastic Net CV.
+  v <- min(n_cv_folds, n_distinct(corn_train$unit_id))
+  if (v < 3) stop("At least three training groups required")
+  set.seed(34549)
+  resampling_foldcv <- rsample::group_vfold_cv(
+    corn_train, group = unit_id, v = v
+  )
+
+  # Translate the grouped fold assignments into cv.glmnet's foldid.
+  # Each training row is assigned to exactly one assessment fold.
+  fold_id <- integer(nrow(corn_train))
+  for (i in seq_len(nrow(resampling_foldcv))) {
+    # Do not rely on row names: use group identity for mapping instead.
+    assessment_groups <- unique(rsample::assessment(
+      resampling_foldcv$splits[[i]]
+    )$unit_id)
+    fold_id[corn_train$unit_id %in% assessment_groups] <- i
+  }
+  stopifnot(all(fold_id > 0))
+
+  # (2) Elastic Net feature selection on TRAINING data only.
+  # Drop zero-variance bands before glmnet.
+  eligible_bands <- band_columns[vapply(
+    corn_train[band_columns], function(z) is.finite(sd(z)) && sd(z) > 0,
+    logical(1)
+  )]
+  train_x <- as.matrix(select(corn_train, all_of(eligible_bands)))
+  train_y <- corn_train$r6_nni_combined
+
+  set.seed(931735)
+  enet_cv <- glmnet::cv.glmnet(
+    x = train_x, y = train_y,
+    family = "gaussian", alpha = alpha,
+    foldid = fold_id, standardize = TRUE,
+    type.measure = "mse"
+  )
+
+  chosen_lambda <- "lambda.1se"
+  enet_coef <- as.matrix(coef(enet_cv, s = chosen_lambda))
+  selected_bands <- setdiff(
+    rownames(enet_coef)[enet_coef[, 1] != 0], "(Intercept)"
+  )
+  if (!length(selected_bands)) {
+    chosen_lambda <- "lambda.min"
+    enet_coef <- as.matrix(coef(enet_cv, s = chosen_lambda))
+    selected_bands <- setdiff(
+      rownames(enet_coef)[enet_coef[, 1] != 0], "(Intercept)"
+    )
+  }
+  if (!length(selected_bands)) stop("No bands selected for ", period_name)
+
+  selected_band_table <- tibble(
+    period = period_name,
+    band = selected_bands,
+    band_number = as.integer(str_remove(selected_bands, "band_")),
+    coefficient = as.numeric(enet_coef[selected_bands, 1]),
+    lambda = chosen_lambda
+  ) %>% arrange(band_number)
+  write_csv(selected_band_table, file.path(out, "selected_bands_enet.csv"))
+  png(file.path(out, "enet_cv.png"), width = 900, height = 650)
+  plot(enet_cv)
+  dev.off()
+  cat("Selected", length(selected_bands), "bands (", chosen_lambda, ")\n")
+  print(selected_band_table, n = Inf)
+
+  # (3) Recipe shared by RF and XGBoost. Formula contains ONLY selected bands.
+  # Both models get identical predictors; unit_id and outcome proxies excluded.
+  formula_selected <- reformulate(selected_bands, response = "r6_nni_combined")
+  corn_recipe <- recipe(formula_selected, data = corn_train) %>%
+    step_zv(all_predictors())
+  corn_prep <- prep(corn_recipe, training = corn_train)
+  p <- bake(corn_prep, new_data = corn_train) %>%
+    select(starts_with("band_")) %>% ncol()
+  if (p < 1) stop("No predictors for ", period_name)
+
+  # (4) Random Forest: 5-fold grouped CV + simulated annealing.
+  rf_spec <- rand_forest(trees = tune(), mtry = tune()) %>%
+    set_engine("ranger", importance = "permutation") %>%
+    set_mode("regression")
+  rf_param <- dials::parameters(
+    dials::mtry(range = c(1L, as.integer(p))),
+    dials::trees(range = c(200L, 1000L))
+  )
+  set.seed(76544)
+  rf_tuning <- finetune::tune_sim_anneal(
+    object = rf_spec,
+    preprocessor = corn_recipe,
+    resamples = resampling_foldcv,
+    param_info = rf_param,
+    iter = rf_iter,
+    metrics = metric_set(rmse, rsq),
+    control = finetune::control_sim_anneal(verbose = FALSE)
+  )
+  write_csv(collect_metrics(rf_tuning), file.path(out, "RF_tuning_metrics.csv"))
+  rf_best <- select_best(rf_tuning, metric = "rmse")
+  write_csv(rf_best, file.path(out, "RF_best_parameters.csv"))
+  rf_final <- finalize_model(rf_spec, rf_best)
+  rf_workflow <- workflow() %>% add_recipe(corn_recipe) %>% add_model(rf_final)
+
+  # (5) XGBoost: SAME bands and grouped folds, but algorithm-specific tuning.
+  # Tree models don't require standardizing the reflectance predictors.
+  xgb_spec <- boost_tree(
+    trees = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    min_n = tune(),
+    mtry = tune(),
+    loss_reduction = tune(),
+    sample_size = 0.8
+  ) %>%
+    set_engine("xgboost", importance = "gain", nthread = 2) %>%
+    set_mode("regression")
+
+  xgb_param <- dials::parameters(
+    dials::trees(range = c(200L, 1000L)),
+    dials::tree_depth(range = c(2L, 8L)),
+    dials::learn_rate(range = c(-3, -1)),  # log10 scale: 0.001–0.1
+    dials::min_n(range = c(2L, 15L)),
+    dials::mtry(range = c(1L, as.integer(p))),
+    dials::loss_reduction(range = c(-5, 0)) # log10 scale
+  )
+
+  set.seed(76545)
+  xgb_grid <- dials::grid_space_filling(xgb_param, size = xgb_candidates)
+  set.seed(76546)
+  xgb_tuning <- tune_grid(
+    object = xgb_spec,
+    preprocessor = corn_recipe,
+    resamples = resampling_foldcv,
+    grid = xgb_grid,
+    metrics = metric_set(rmse, rsq),
+    control = control_grid(save_pred = FALSE)
+  )
+  write_csv(collect_metrics(xgb_tuning), file.path(out, "XGB_tuning_metrics.csv"))
+  xgb_best <- select_best(xgb_tuning, metric = "rmse")
+  write_csv(xgb_best, file.path(out, "XGB_best_parameters.csv"))
+  xgb_final <- finalize_model(xgb_spec, xgb_best)
+  xgb_workflow <- workflow() %>% add_recipe(corn_recipe) %>% add_model(xgb_final)
+
+  # (6) Held-out testing; neither algorithm sees test outcomes while fitting.
+  evaluate_model <- function(wf, model_name) {
+    final_fit <- last_fit(
+      wf, split = corn_split, metrics = metric_set(rmse, rsq, mae)
+    )
+    test_predictions <- collect_predictions(final_fit) %>%
+      mutate(period = period_name, model = model_name)
+    test_metrics <- collect_metrics(final_fit) %>%
+      mutate(period = period_name, model = model_name, dataset = "Test")
+
+    # Apparent training metrics are descriptive, NOT CV estimates.
+    fitted_train <- fit(wf, data = corn_train)
+    train_predictions <- augment(fitted_train, new_data = corn_train) %>%
+      mutate(period = period_name, model = model_name)
+    train_metrics <- score_predictions(
+      train_predictions, period_name, model_name, "Train"
+    )
+    write_csv(test_predictions,
+              file.path(out, paste0(model_name, "_test_predictions.csv")))
+    write_csv(train_predictions,
+              file.path(out, paste0(model_name, "_train_predictions.csv")))
+    write_csv(test_metrics,
+              file.path(out, paste0(model_name, "_test_metrics.csv")))
+    write_csv(train_metrics,
+              file.path(out, paste0(model_name, "_train_metrics.csv")))
+    plot_obj <- save_pred_plot(test_predictions, period_name, model_name, out)
+
+    # Variable importance is algorithm specific: RF permutation; XGB gain.
+    importance <- vip::vi(extract_fit_engine(fitted_train))
+    write_csv(importance,
+              file.path(out, paste0(model_name, "_band_importance.csv")))
+
+    list(fitted = fitted_train, last_fit = final_fit,
+         test_predictions = test_predictions, test_metrics = test_metrics,
+         train_metrics = train_metrics, importance = importance,
+         plot = plot_obj)
+  }
+
+  rf_result <- evaluate_model(rf_workflow, "RF")
+  xgb_result <- evaluate_model(xgb_workflow, "XGBoost")
+
+  all_metrics <- bind_rows(
+    rf_result$train_metrics, rf_result$test_metrics,
+    xgb_result$train_metrics, xgb_result$test_metrics
+  )
+  write_csv(all_metrics, file.path(out, "RF_XGB_metrics.csv"))
+  print(all_metrics %>% select(period, model, dataset, .metric, .estimate))
+
+  list(period = period_name, split = corn_split,
+       selected_bands = selected_band_table,
+       enet = enet_cv, rf_tuning = rf_tuning, xgb_tuning = xgb_tuning,
+       RF = rf_result, XGBoost = xgb_result, metrics = all_metrics)
+}
+```
+
+# 4. Run independent period models
+
+```{r run-periods}
+# Computationally expensive: RF simulated annealing + XGBoost grid × 5 folds × 3 periods.
+# For a quick check first, temporarily set rf_iterations <- 5 and xgb_grid_size <- 5.
+results <- list()
+for (period_name in c("Early", "Mid", "Late")) {
+  results[[period_name]] <- fit_one_period(period_name)
+}
+```
+
+# 5. Compare Random Forest and XGBoost across periods
+
+```{r comparison}
+comparison_long <- bind_rows(lapply(results, `[[`, "metrics"))
+comparison <- comparison_long %>%
+  select(period, model, dataset, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  arrange(factor(period, levels = c("Early", "Mid", "Late")),
+          model, dataset)
+print(comparison, n = Inf)
+write_csv(comparison, file.path(output_dir, "RF_XGBoost_period_comparison.csv"))
+
+selected_by_period <- bind_rows(lapply(results, `[[`, "selected_bands"))
+write_csv(selected_by_period,
+          file.path(output_dir, "all_period_selected_bands.csv"))
+```
+
+```{r test-comparison-chart}
+comparison_long %>%
+  filter(dataset == "Test", .metric %in% c("rmse", "rsq")) %>%
+  ggplot(aes(x = period, y = .estimate, fill = model)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~.metric, scales = "free_y") +
+  labs(x = "Growth period", y = "Held-out test estimate",
+       title = "Corn NNI performance: RF vs XGBoost") +
+  theme_bw()
+```
+
+# 6. Selected bands, by period
+
+```{r selected-bands}
+selected_by_period %>%
+  count(period, name = "number_of_selected_bands") %>%
+  print()
+selected_by_period %>%
+  select(period, band, band_number, coefficient, lambda) %>%
+  print(n = Inf)
+```
+
+```{r}
+#| label: model-comparison-poster
+#| fig-width: 14
+#| fig-height: 9
+#| dpi: 300
+#| warning: false
+#| message: false
+
+library(tidyverse)
+
+# ============================================================
+# 1. Prepare performance data
+# ============================================================
+
+comparison_plot_data <- comparison_long %>%
+  filter(
+    dataset %in% c("Train", "Test"),
+    .metric %in% c("rmse", "rsq")
+  ) %>%
+  mutate(
+    # Order growth periods
+    period = factor(
+      period,
+      levels = c("Early", "Mid", "Late")
+    ),
+
+    # Train comes before Test
+    dataset = factor(
+      dataset,
+      levels = c("Train", "Test")
+    ),
+
+    # Rename metrics for figure
+    .metric = factor(
+      .metric,
+      levels = c("rsq", "rmse"),
+      labels = c("R²", "RMSE")
+    ),
+
+    # Model order
+    model = factor(
+      model,
+      levels = c("RF", "XGBoost")
+    )
+  )
+
+# Verify data
+comparison_plot_data %>%
+  count(dataset, period, model, .metric) %>%
+  print(n = Inf)
+
+
+# ============================================================
+# 2. Create poster-ready performance plot
+# ============================================================
+
+performance_plot <- comparison_plot_data %>%
+  ggplot(
+    aes(
+      x = period,
+      y = .estimate,
+      fill = model
+    )
+  ) +
+
+  # Bars
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    color = "black",
+    linewidth = 0.35
+  ) +
+
+  # Performance values above bars
+  geom_text(
+    aes(
+      label = sprintf("%.2f", .estimate)
+    ),
+    position = position_dodge(width = 0.8),
+    vjust = -0.5,
+    size = 5.5,
+    fontface = "bold",
+    color = "black"
+  ) +
+
+  # R² and RMSE rows, Train and Test columns
+  facet_grid(
+    .metric ~ dataset,
+    scales = "free_y"
+  ) +
+
+  # Colorblind-friendly Okabe-Ito palette
+  scale_fill_manual(
+    values = c(
+      "RF" = "#0072B2",
+      "XGBoost" = "#D55E00"
+    ),
+    labels = c(
+      "Random Forest",
+      "XGBoost"
+    ),
+    name = "Model"
+  ) +
+
+  # Extra space for numerical labels
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+
+  # Figure titles and labels
+  labs(
+    title = "Corn NNI Prediction Performance",
+    subtitle = "Random Forest vs. XGBoost across Growth Periods",
+    x = "Growth Period",
+    y = "Model Performance"
+  ) +
+
+  # Base theme
+  theme_bw(base_size = 20) +
+
+  theme(
+    # Main title
+    plot.title = element_text(
+      size = 28,
+      face = "bold",
+      hjust = 0.5,
+      margin = margin(b = 8)
+    ),
+
+    # Subtitle
+    plot.subtitle = element_text(
+      size = 20,
+      hjust = 0.5,
+      margin = margin(b = 15)
+    ),
+
+    # Axis titles
+    axis.title.x = element_text(
+      size = 23,
+      face = "bold",
+      margin = margin(t = 12)
+    ),
+
+    axis.title.y = element_text(
+      size = 23,
+      face = "bold",
+      margin = margin(r = 12)
+    ),
+
+    # Axis labels
+    axis.text.x = element_text(
+      size = 20,
+      face = "bold",
+      color = "black"
+    ),
+
+    axis.text.y = element_text(
+      size = 18,
+      face = "bold",
+      color = "black"
+    ),
+
+    # Panel labels: R², RMSE, Train, Test
+    strip.text = element_text(
+      size = 25,
+      face = "bold",
+      color = "black"
+    ),
+
+    strip.background = element_rect(
+      fill = "gray92",
+      color = "black",
+      linewidth = 0.6
+    ),
+
+    # Legend
+    legend.position = "bottom",
+
+    legend.title = element_text(
+      size = 21,
+      face = "bold"
+    ),
+
+    legend.text = element_text(
+      size = 20
+    ),
+
+    legend.key.size = unit(0.8, "cm"),
+
+    # Grid
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+
+    panel.grid.major.y = element_line(
+      color = "gray85",
+      linewidth = 0.3
+    ),
+
+    # Panel borders
+    panel.border = element_rect(
+      color = "black",
+      linewidth = 0.7
+    ),
+
+    # Spacing between panels
+    panel.spacing = unit(1.2, "lines"),
+
+    # Margins
+    plot.margin = margin(
+      20, 25, 20, 20
+    )
+  )
+
+# Display figure
+print(performance_plot)
+
+
+# ============================================================
+# 3. Save publication-quality figures
+# ============================================================
+
+dir.create(
+  "../output4",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# High-resolution PNG
+ggsave(
+  filename = "../output4/NNI_RF_XGBoost_Poster.png",
+  plot = performance_plot,
+  width = 14,
+  height = 9,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+# Vector PDF
+ggsave(
+  filename = "../output4/NNI_RF_XGBoost_Poster.pdf",
+  plot = performance_plot,
+  width = 14,
+  height = 9,
+  units = "in",
+  device = "pdf",
+  bg = "white"
+)
+
+# Optional editable SVG
+# install.packages("svglite")
+
+if (requireNamespace("svglite", quietly = TRUE)) {
+  ggsave(
+    filename = "../output4/NNI_RF_XGBoost_Poster.svg",
+    plot = performance_plot,
+    width = 14,
+    height = 9,
+    units = "in"
+  )
+}
+```
+
+```{r}
+names(comparison_plot_data)
+```
+
+
+# 7. Scientific notes
+
+- **Holdout:** group-based splitting prevents measurements from one experimental unit from appearing in both training and test partitions. This is preferable to row-level splitting when units recur.
+- **Within-group comparison:** RF and XGBoost use the same period-specific Elastic Net band set and the same held-out test partition; both choose hyperparameters by minimum CV RMSE.
+- **CV feature-selection leakage:** these CV tuning results are *not* fully nested. The feature selector is trained on the full training subset, which includes the future CV assessment folds. Interpret CV metrics as tuning diagnostics, not unbiased validation of the full selector/model pipeline.
+- **Across-period comparisons:** sample size and year/site differ by period. Compare cautiously and consider external validation by field/year if available.
+- **R² definition:** `yardstick::rsq()` is squared Pearson correlation. It need not match the out-of-sample coefficient of determination `1 - SSE/SST`.
+- **XGBoost gain vs RF permutation:** the importance scores come from different definitions and should not be compared numerically between algorithms.

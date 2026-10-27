@@ -1,0 +1,8 @@
+period,band,band_number,coefficient,lambda
+Mid,band_161,161,-1.1769833984298756,lambda.1se
+Mid,band_176,176,-0.1334212127159085,lambda.1se
+Mid,band_252,252,1.4281989671797224,lambda.1se
+Mid,band_253,253,1.844333281344988,lambda.1se
+Mid,band_254,254,0.030948953567798594,lambda.1se
+Mid,band_256,256,1.2016316723154319,lambda.1se
+Mid,band_257,257,0.4655031794338502,lambda.1se

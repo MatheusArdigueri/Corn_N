@@ -1,0 +1,8 @@
+period,band,band_number,coefficient,lambda
+Early,band_161,161,-0.8656341723938263,lambda.min
+Early,band_162,162,-1.0726431846037354,lambda.min
+Early,band_163,163,-1.5465734146802066,lambda.min
+Early,band_164,164,-1.85200291211237,lambda.min
+Early,band_165,165,-1.7432668175139756,lambda.min
+Early,band_166,166,-1.387877646914309,lambda.min
+Early,band_167,167,-0.6140838949480691,lambda.min

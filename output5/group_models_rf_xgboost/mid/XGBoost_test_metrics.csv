@@ -1,0 +1,4 @@
+.metric,.estimator,.estimate,.config,period,model,dataset
+rmse,standard,0.351529181491699,pre0_mod0_post0,Mid,XGBoost,Test
+rsq,standard,0.4687962812548292,pre0_mod0_post0,Mid,XGBoost,Test
+mae,standard,0.266912806300718,pre0_mod0_post0,Mid,XGBoost,Test
