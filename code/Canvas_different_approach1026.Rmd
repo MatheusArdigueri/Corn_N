@@ -1,0 +1,213 @@
+---
+title: "N-canvas"
+author: "Matheus Ardigueri"
+date: "2026-10-26"
+output: html_document
+---
+
+# Loading packages
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyverse)
+library(janitor)
+library(ggplot2)
+
+
+```
+
+# Import dataset
+
+```{r}
+N_all <- read_xlsx("./data/thiago2024/Corn_N_calculations.xlsx", sheet = "R6 Combined_real")
+N_all
+
+```
+
+# Cleaning names
+
+```{r}
+N_all_clean_names <- N_all %>%
+  clean_names()
+N_all_clean_names
+
+```
+
+# Filtering bands
+
+```{r}
+# 300 bands reflectance, let's filter the noise.
+
+wavelengths <- c(377.79, 379.8, 381.81, 383.83, 385.85, 387.86, 389.88, 391.9, 393.92, 395.94, 397.96, 399.99, 402.01, 404.03, 406.06, 408.08, 410.11, 412.14, 414.16, 416.19, 418.22, 420.25, 422.29, 424.32, 426.35, 428.38, 430.42, 432.46, 434.49, 436.53, 438.57, 440.61, 442.65, 444.69, 446.73, 448.77, 450.81, 452.86, 454.9, 456.95, 459.0, 461.04, 463.09, 465.14, 467.19, 469.24, 471.29, 473.34, 475.4, 477.45, 479.51, 481.56, 483.62, 485.68, 487.73, 489.79, 491.85, 493.91, 495.98, 498.04, 500.1, 502.17, 504.23, 506.3, 508.36, 510.43, 512.5, 514.57, 516.64, 518.71, 520.78, 522.85, 524.93, 527.0, 529.07, 531.15, 533.23, 535.3, 537.38, 539.46, 541.54, 543.62, 545.7, 547.79, 549.87, 551.95, 554.04, 556.13, 558.21, 560.3, 562.39, 564.48, 566.57, 568.66, 570.75, 572.84, 574.94, 577.03, 579.13, 581.22, 583.32, 585.42, 587.51, 589.61, 591.71, 593.81, 595.92, 598.02, 600.12, 602.23, 604.33, 606.44, 608.54, 610.65, 612.76, 614.87, 616.98, 619.09, 621.2, 623.31, 625.43, 627.54, 629.66, 631.77, 633.89, 636.01, 638.13, 640.25, 642.37, 644.49, 646.61, 648.73, 650.85, 652.98, 655.1, 657.23, 659.36, 661.48, 663.61, 665.74, 667.87, 670.0, 672.14, 674.27, 676.4, 678.54, 680.67, 682.81, 684.94, 687.08, 689.22, 691.36, 693.5, 695.64, 697.78, 699.93, 702.07, 704.21, 706.36, 708.5, 710.65, 712.8, 714.95, 717.1, 719.25, 721.4, 723.55, 725.7, 727.86, 730.01, 732.17, 734.32, 736.48, 738.64, 740.8, 742.96, 745.12, 747.28, 749.44, 751.6, 753.77, 755.93, 758.09, 760.26, 762.43, 764.6, 766.76, 768.93, 771.1, 773.28, 775.45, 777.62, 779.79, 781.97, 784.14, 786.32, 788.5, 790.67, 792.85, 795.03, 797.21, 799.39, 801.58, 803.76, 805.94, 808.13, 810.31, 812.5, 814.69, 816.87, 819.06, 821.25, 823.44, 825.63, 827.83, 830.02, 832.21, 834.41, 836.6, 838.8, 841.0, 843.19, 845.39, 847.59, 849.79, 851.99, 854.2, 856.4, 858.6, 860.81, 863.01, 865.22, 867.43, 869.63, 871.84, 874.05, 876.26, 878.47, 880.69, 882.9, 885.11, 887.33, 889.54, 891.76, 893.98, 896.2, 898.41, 900.63, 902.85, 905.08, 907.3, 909.52, 911.74, 913.97, 916.19, 918.42, 920.65, 922.88, 925.11, 927.33, 929.57, 931.8, 934.03, 936.26, 938.5, 940.73, 942.97, 945.2, 947.44, 949.68, 951.92, 954.16, 956.4, 958.64, 960.88, 963.12, 965.37, 967.61, 969.86, 972.1, 974.35, 976.6, 978.85, 981.1, 983.35, 985.6, 987.85, 990.11, 992.36, 994.62, 996.87, 999.13, 1001.38, 1003.64, 1005.9, 1008.16, 1010.42, 1012.68, 1014.95, 1017.21)
+
+N_reflectance_clean <- N_all_clean_names %>%
+  select(
+    1:16,
+    band_13:band_292
+  )
+
+N_reflectance_clean
+
+```
+
+# Outlier measurements
+
+```{r}
+NNI_outliers <- N_reflectance_clean %>%
+  pivot_longer(
+    cols = c(
+      r1_nni,
+      r6_nni_combined
+    ),
+    names_to = "parameter",
+    values_to = "NNI"
+  ) %>%
+  group_by(parameter) %>%
+  mutate(
+    Q1 = quantile(NNI, 0.25, na.rm = TRUE),
+    Q3 = quantile(NNI, 0.75, na.rm = TRUE),
+    IQR = Q3 - Q1,
+    Lower = Q1 - 1.5 * IQR,
+    Upper = Q3 + 1.5 * IQR,
+    Outlier = NNI < Lower | NNI > Upper
+  ) %>%
+  ungroup()
+
+NNI_outliers %>%
+  filter(!is.na(NNI)) %>%
+  group_by(parameter) %>%
+  summarise(
+    n = n(),
+    n_outliers = sum(Outlier),
+    Lower = first(Lower),
+    Upper = first(Upper),
+    .groups = "drop"
+  )
+
+NNI_outliers %>%
+  ggplot(aes(
+    x = parameter,
+    y = NNI
+  )) +
+  geom_boxplot(
+    fill = "gray",
+    color = "black",
+    width = 0.5,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    aes(color = Outlier),
+    width = 0.12,
+    size = 2,
+    alpha = 0.7
+  ) +
+  scale_color_manual(
+    values = c(
+      "FALSE" = "blue",
+      "TRUE" = "red"
+    ),
+    na.value = "gray"
+  )  +
+  labs(
+    title = "Potential Outliers in Corn NNI Measurements",
+    x = "Parameter",
+    y = "Nitrogen Nutrition Index",
+    color = "Potential outlier"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      color = "black"
+    ),
+    strip.text = element_text(
+      face = "bold"
+    )
+  )
+```
+
+#
+
+```{r}
+NNI_outliers %>%
+  filter(Outlier %in% TRUE) %>%
+  select(
+    any_of(c(
+      "study_field",
+      "year",
+      "stage",
+      "group",
+      "dap",
+      "id",
+      "n_treatment"
+    )),
+    parameter,
+    NNI,
+    Lower,
+    Upper
+  ) %>%
+  arrange(
+    parameter,
+    desc(NNI)
+  )
+NNI_group_outliers <- N_reflectance_clean %>%
+  pivot_longer(
+    cols = c(r1_nni, r6_nni_combined),
+    names_to = "parameter",
+    values_to = "NNI"
+  ) %>%
+  group_by(group, parameter) %>%
+  mutate(
+    Q1 = quantile(NNI, 0.25, na.rm = TRUE),
+    Q3 = quantile(NNI, 0.75, na.rm = TRUE),
+    IQR = Q3 - Q1,
+    Lower = Q1 - 1.5 * IQR,
+    Upper = Q3 + 1.5 * IQR,
+    Outlier = NNI < Lower | NNI > Upper
+  ) %>%
+  ungroup()
+
+NNI_group_outliers %>%
+  filter(!is.na(NNI)) %>%
+  ggplot(aes(
+    x = group,
+    y = NNI,
+    fill = group
+  )) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.6
+  ) +
+  geom_jitter(
+    aes(color = Outlier),
+    width = 0.12,
+    size = 1.5,
+    alpha = 0.7
+  ) +
+  facet_wrap(
+    ~ parameter,
+    scales = "free_y"
+  ) +
+  scale_color_manual(
+    values = c(
+      "FALSE" = "blue",
+      "TRUE" = "red"
+    ),
+    na.value = "gray"
+  ) +
+  labs(
+    title = "Corn NNI Outliers Across Growth Groups",
+    x = "Growth Group",
+    y = "NNI",
+    color = "Potential outlier"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(face = "bold")
+  )
+```
+
+
+

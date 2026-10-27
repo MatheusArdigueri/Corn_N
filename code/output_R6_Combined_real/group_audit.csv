@@ -1,0 +1,8 @@
+"Group","Experiment","Stage","rows","plots","measured_target","r1_available","late_combined_available"
+"R1-R2","IxN/Camilla | 2025","R1",48,48,48,48,48
+"R1-R2","IxN/Camilla | 2025","R2",48,48,48,48,48
+"R1-R2","USDA/Ironhorse | 2024","R1",24,24,24,24,24
+"R1-R2","USDA/Ironhorse | 2024","R2",24,24,24,24,24
+"R5-R6","IxN/Ironhorse | 2024","R5",72,72,72,0,72
+"R5-R6","USDA/Ironhorse | 2024","R6",24,24,24,0,24
+"V8","IxN/Camilla | 2025","V8",48,48,48,48,48

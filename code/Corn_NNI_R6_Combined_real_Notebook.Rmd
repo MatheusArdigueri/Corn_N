@@ -1,0 +1,786 @@
+---
+title: "Corn nitrogen status from UAV hyperspectral imagery"
+subtitle: "Single-sheet workflow: R6 Combined_real | V8, R1-R2, R5-R6"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+  html_notebook:
+    toc: true
+    toc_depth: 2
+---
+
+## Scope and scientific interpretation
+
+Only **`R6 Combined_real`** in `Corn_N_calculations.xlsx` is imported. Its existing `Group` values are used, not reconstructed: `V8` (early), `R1-R2` (mid), and `R5-R6` (late). The workbook contains 288 rows, but check your copy with the audit below.
+
+**Target warning:** `R6_NNI_Combined` appears to be the sum of leaf, stalk, and ear NNI, *not conventional whole-plant NNI*. Furthermore, that column is populated on early-stage rows, apparently carrying a late-stage value across measurements of the same plot. Predicting it from early images would predict a future outcome, not contemporaneous early NNI. Therefore this notebook uses `R1 NNI` in `V8` and `R1-R2`, and `R6_NNI_Combined` only for `R5-R6`. The late target must be revalidated scientifically before claiming whole-plant NNI predictions. Group names are **developmental windows**, not necessarily identical measured targets. Do not pool performance metrics across groups as if their targets have the same definition.
+
+**Pipeline:** PCA for unsupervised exploration → Elastic Net selects informative bands **within each training fold** → selected-band indices are computed → RF and radial SVM are tuned and tested by **held-out plot**. PCA is *not* used to select features from the response; it is a separate exploratory analysis.
+
+## 1. Packages
+
+```{r libraries, message=FALSE, warning=FALSE}
+# install.packages(c("readxl", "dplyr", "tidyr", "ggplot2", "stringr",
+#                    "glmnet", "ranger", "kernlab", "purrr"))
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(glmnet)
+library(ranger)
+library(kernlab)
+library(purrr)
+```
+
+## 2. Settings
+
+```{r settings}
+input_file <- "../data/thiago2024/Corn_N_calculations.xlsx"
+sheet_name <- "R6 Combined_real"
+output_dir <- "output_R6_Combined_real"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Set to path of the Resonon ENVI .hdr when available (recommended).
+# Without it, band-to-wavelength mapping is approximate and
+# calculated indices should be regarded as exploratory.
+hdr_file <- NA_character_
+
+seed <- 2026
+n_folds <- 5
+alpha_grid <- c(0.25, 0.5, 0.75, 1)
+max_bands <- 30
+max_indices <- 30
+run_late_unvalidated <- FALSE  # Set TRUE only for exploratory late-target modeling
+```
+
+## 3. Read **one worksheet only**
+
+```{r import}
+stopifnot(file.exists(input_file))
+stopifnot(sheet_name %in% excel_sheets(input_file))
+
+corn <- read_excel(input_file, sheet = sheet_name)
+names(corn)[1:16]
+```
+
+```{r clean-columns}
+required <- c("N_Treatment", "Study/Field", "Year", "Stage", "Group",
+              "Date", "DAP", "ID", "R1 NNI", "R6_NNI_Combined")
+stopifnot(all(required %in% names(corn)))
+
+band_cols <- paste0("Band_", 5:293)  # 400–1000 nm approximately
+stopifnot(all(band_cols %in% names(corn)))
+
+corn <- corn %>%
+  mutate(
+    across(all_of(c(band_cols, "R1 NNI", "R6_NNI_Combined")), as.numeric),
+    Group = as.character(Group),
+    Experiment = paste(`Study/Field`, Year, sep = " | "),
+    Plot_ID = paste(`Study/Field`, Year, ID, sep = " | "),
+    NNI_target = if_else(Group == "R5-R6", `R6_NNI_Combined`, `R1 NNI`),
+    Target_definition = if_else(Group == "R5-R6", "R6 combined organ-index sum", "R1 NNI")
+  )
+
+corn %>% count(Group, Stage, Experiment, name = "rows")
+```
+
+## 4. Audit groups, valid targets, repeated plots and source definitions
+
+```{r audit}
+audit <- corn %>%
+  group_by(Group, Experiment, Stage) %>%
+  summarise(
+    rows = n(),
+    plots = n_distinct(Plot_ID),
+    measured_target = sum(is.finite(NNI_target)),
+    r1_available = sum(is.finite(`R1 NNI`)),
+    late_combined_available = sum(is.finite(R6_NNI_Combined)),
+    .groups = "drop"
+  )
+print(audit, n = Inf)
+write.csv(audit, file.path(output_dir, "group_audit.csv"), row.names = FALSE)
+
+# Detect whether the R6 combined target remains constant across plot dates.
+corn %>% group_by(Plot_ID) %>%
+  summarise(stages = n_distinct(Stage),
+            late_target_values = n_distinct(R6_NNI_Combined, na.rm = TRUE),
+            .groups = "drop") %>%
+  count(stages, late_target_values)
+```
+
+```{r target-plot}
+corn %>%
+  filter(is.finite(NNI_target)) %>%
+  ggplot(aes(x = N_Treatment, y = NNI_target, fill = N_Treatment)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.12, alpha = 0.5, size = 1) +
+  facet_wrap(~ Group, scales = "free_y") +
+  labs(title = "Target distribution by growth group", x = "N treatment",
+       y = "Group-specific NNI variable") +
+  theme_bw() + theme(legend.position = "none")
+```
+
+## 5. Wavelength lookup and spectra
+
+```{r wavelength-map}
+# Read ENVI header wavelengths if available; otherwise approximate using
+# the first and last wavelengths reported in the provided sensor screenshot.
+read_hdr_wavelengths <- function(path) {
+  s <- paste(readLines(path, warn = FALSE), collapse = " ")
+  matched <- regmatches(s, regexpr("wavelength\\s*=\\s*\\{[^}]+\\}", s, ignore.case = TRUE))
+  if (!length(matched) || !nzchar(matched)) stop("No wavelength array in HDR")
+  vals <- sub("^[^{]*\\{", "", matched)
+  vals <- sub("\\}.*$", "", vals)
+  as.numeric(trimws(strsplit(vals, ",")[[1]]))
+}
+
+if (!is.na(hdr_file) && file.exists(hdr_file)) {
+  wavelength_all <- read_hdr_wavelengths(hdr_file)
+  stopifnot(length(wavelength_all) == 300)
+  wavelength_source <- "ENVI header (exact)"
+} else {
+  wavelength_all <- seq(393.8, 1035.12, length.out = 300)
+  wavelength_source <- "APPROXIMATE interpolation; supply HDR for publication"
+  warning(wavelength_source)
+}
+
+band_map <- data.frame(Band = band_cols, Band_Number = 5:293,
+                       Wavelength = wavelength_all[5:293])
+head(band_map)
+```
+
+```{r spectral-curves}
+spectral_long <- corn %>%
+  select(Experiment, Plot_ID, Group, Stage, N_Treatment, all_of(band_cols)) %>%
+  pivot_longer(all_of(band_cols), names_to = "Band", values_to = "Reflectance") %>%
+  left_join(band_map, by = "Band")
+
+spectral_mean <- spectral_long %>%
+  group_by(Experiment, Group, N_Treatment, Wavelength) %>%
+  summarise(mean_reflectance = mean(Reflectance, na.rm = TRUE), .groups = "drop")
+
+ggplot(spectral_mean, aes(Wavelength, mean_reflectance, color = N_Treatment)) +
+  geom_line(linewidth = 0.65) +
+  facet_grid(Experiment ~ Group, scales = "free_y") +
+  labs(title = "Mean reflectance by treatment", x = "Wavelength (nm)",
+       y = "Reflectance", subtitle = wavelength_source) +
+  theme_bw()
+```
+
+## 6. Exploratory PCA (within each group)
+
+```{r pca-function}
+run_pca <- function(dat, label) {
+  x <- as.matrix(dat[, band_cols])
+  ok <- rowSums(!is.finite(x)) == 0
+  x <- x[ok, , drop = FALSE]
+  d <- dat[ok, , drop = FALSE]
+  nonconstant <- apply(x, 2, sd) > 0
+  x <- x[, nonconstant, drop = FALSE]
+  if (nrow(x) < 4 || ncol(x) < 2) return(NULL)
+  p <- prcomp(x, center = TRUE, scale. = TRUE)
+  var <- p$sdev^2 / sum(p$sdev^2)
+  scores <- bind_cols(d %>% select(Experiment, Plot_ID, Group, N_Treatment),
+                      as.data.frame(p$x[, 1:2, drop = FALSE]))
+  print(ggplot(scores, aes(PC1, PC2, color = N_Treatment)) +
+          geom_point(size = 2.5) +
+          labs(title = paste("PCA:", label),
+               x = paste0("PC1 (", round(100*var[1], 1), "%)"),
+               y = paste0("PC2 (", round(100*var[2], 1), "%)")) +
+          theme_bw())
+  invisible(p)
+}
+```
+
+```{r pca-run, fig.height=5}
+for (g in unique(corn$Group)) {
+  run_pca(filter(corn, Group == g), g)
+}
+```
+
+## 7. Validation design and feature engineering
+
+**Important:** spectral selection and vegetation-index choice are recalculated on each training fold. We evaluate *plots* held out, not spectra from plots also seen during training. Groups contain multiple experiments with different treatments; these results measure held-out-plot performance, **not** transferability to an unseen site or year.
+
+```{r functions-splits}
+# Assign all observations belonging to a plot to the same fold.
+make_folds <- function(plot_ids, k, seed = 2026) {
+  u <- unique(as.character(plot_ids))
+  set.seed(seed)
+  u <- sample(u)
+  k <- min(k, length(u))
+  if (k < 2) stop("Need at least two distinct plots")
+  map <- setNames(rep(seq_len(k), length.out = length(u)), u)
+  as.integer(map[as.character(plot_ids)])
+}
+
+safe_metrics <- function(obs, pred) {
+  data.frame(n = length(obs),
+             RMSE = sqrt(mean((obs - pred)^2)),
+             MAE = mean(abs(obs - pred)),
+             R2 = if (length(obs) > 2 && var(obs) > 0)
+               1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2) else NA_real_,
+             Bias = mean(pred - obs))
+}
+```
+
+```{r elastic-net}
+# Screen bands using an internally CV-tuned Elastic Net on TRAINING plots only.
+select_bands <- function(train, seed_local) {
+  y <- train$NNI_target
+  x <- as.matrix(train[, band_cols])
+  keep <- apply(x, 2, sd) > 0
+  x <- x[, keep, drop = FALSE]
+  if (ncol(x) < 2) stop("Too few variable bands")
+  foldid <- make_folds(train$Plot_ID, min(5, n_distinct(train$Plot_ID)), seed_local)
+  fits <- lapply(alpha_grid, function(a) {
+    cv.glmnet(x, y, alpha = a, foldid = foldid,
+              family = "gaussian", standardize = TRUE)
+  })
+  errors <- vapply(fits, function(m) min(m$cvm), numeric(1))
+  best <- fits[[which.min(errors)]]
+  b <- as.matrix(coef(best, s = "lambda.1se"))
+  nm <- rownames(b)[-1]
+  sel <- nm[abs(b[-1, 1]) > 0]
+  if (length(sel) == 0) {
+    b <- as.matrix(coef(best, s = "lambda.min"))
+    sel <- rownames(b)[-1][abs(b[-1, 1]) > 0]
+  }
+  # If Elastic Net selects many correlated bands, retain largest coefficients.
+  coef_vals <- abs(b[sel, 1]); names(coef_vals) <- sel
+  sel <- names(sort(coef_vals, decreasing = TRUE))[seq_len(min(length(sel), max_bands))]
+  list(bands = sel, alpha = alpha_grid[which.min(errors)])
+}
+```
+
+```{r vegetation-indices}
+# Generate indices *only* from ENet-selected bands.
+# Two-band NDI=(Ri-Rj)/(Ri+Rj); ratio=Ri/Rj.
+# Region labels constrain biologically interpretable comparisons.
+region <- function(w) {
+  ifelse(w >= 520 & w < 600, "green",
+  ifelse(w >= 620 & w < 680, "red",
+  ifelse(w >= 680 & w < 750, "rededge",
+  ifelse(w >= 750 & w <= 1000, "nir", "other"))))
+}
+
+candidate_pairs <- function(sel) {
+
+  bands <- unique(sel)
+
+  if (length(bands) < 2) {
+    return(data.frame(
+      a = character(),
+      z = character()
+    ))
+  }
+
+  pairs <- combn(
+    bands,
+    2
+  )
+
+  data.frame(
+    a = pairs[1, ],
+    z = pairs[2, ]
+  )
+}
+
+# Model-derived candidate index screening is restricted to TRAINING data.
+indices_for_data <- function(dat, pairs) {
+  out <- data.frame(row = seq_len(nrow(dat)))
+  for (i in seq_len(nrow(pairs))) {
+    a <- pairs$a[i]; z <- pairs$z[i]
+    den <- dat[[a]] + dat[[z]]
+    val <- ifelse(abs(den) > 1e-10, (dat[[a]] - dat[[z]]) / den, NA_real_)
+    out[[paste0("NDI_", a, "_", z)]] <- val
+  }
+  out$row <- NULL
+  out
+}
+
+pick_indices <- function(train, selection) {
+
+  # Check bands selected by Elastic Net
+  selected_regions <- band_map %>%
+    filter(Band %in% selection$bands) %>%
+    mutate(
+      Region = region(Wavelength)
+    ) %>%
+    count(Region)
+
+  print(selected_regions)
+
+  # Generate candidate NDSIs
+  pairs <- candidate_pairs(selection$bands)
+
+  if (nrow(pairs) == 0) {
+    return(pairs)
+  }
+
+  xi <- indices_for_data(train, pairs)
+
+  scores <- vapply(xi, function(z) {
+
+    ok <- is.finite(z) &
+      is.finite(train$NNI_target)
+
+    if (sum(ok) < 5 || sd(z[ok]) == 0) {
+      return(0)
+    }
+
+    abs(cor(
+      z[ok],
+      train$NNI_target[ok]
+    ))
+
+  }, numeric(1))
+
+  head(
+    pairs[
+      order(scores, decreasing = TRUE),
+      ,
+      drop = FALSE
+    ],
+    max_indices
+  )
+}
+```
+
+## 8. Random Forest and SVM, with held-out-plot CV
+
+```{r models}
+fit_predict <- function(train_x, train_y, test_x, model) {
+  # Remove constant or nonfinite index columns based on training data.
+  good <- vapply(train_x, function(v) all(is.finite(v)) && sd(v) > 0, logical(1))
+  train_x <- train_x[, good, drop = FALSE]
+  test_x <- test_x[, good, drop = FALSE]
+  if (ncol(train_x) == 0 || any(!is.finite(as.matrix(test_x)))) return(rep(NA_real_, nrow(test_x)))
+  colnames(train_x) <- make.names(colnames(train_x), unique = TRUE)
+  colnames(test_x) <- colnames(train_x)
+  if (model == "RF") {
+    fit <- ranger(y ~ ., data = data.frame(y = train_y, train_x),
+                  num.trees = 500,
+                  mtry = max(1, floor(sqrt(ncol(train_x)))),
+                  min.node.size = 5, seed = seed)
+    return(predict(fit, data = test_x)$predictions)
+  }
+  # Train-only centering and scaling for radial SVM.
+  mu <- vapply(train_x, mean, numeric(1))
+  sc <- vapply(train_x, sd, numeric(1))
+  xs <- scale(as.matrix(train_x), center = mu, scale = sc)
+  ts <- scale(as.matrix(test_x), center = mu, scale = sc)
+  fit <- ksvm(x = xs, y = train_y, type = "eps-svr", kernel = "rbfdot",
+              C = 1, kpar = "automatic", scaled = FALSE)
+  as.numeric(predict(fit, ts))
+}
+```
+
+```{r evaluation-function}
+evaluate_group <- function(dat, group_name) {
+  dat <- dat %>% filter(is.finite(NNI_target))
+  valid_spec <- rowSums(!is.finite(as.matrix(dat[, band_cols]))) == 0
+  dat <- dat[valid_spec, , drop = FALSE]
+  if (n_distinct(dat$Plot_ID) < 8 || nrow(dat) < 12) {
+    message("Skipped ", group_name, ": insufficient valid independent plots")
+    return(NULL)
+  }
+  fold <- make_folds(dat$Plot_ID, n_folds, seed)
+  outputs <- list(); selected <- list(); i <- 0
+  for (f in sort(unique(fold))) {
+    train <- dat[fold != f, , drop = FALSE]
+    test <- dat[fold == f, , drop = FALSE]
+    en <- select_bands(train, seed + f)
+    pairs <- pick_indices(train, en)
+    if (nrow(pairs) == 0) {
+      message("Skipped ", group_name, " fold ", f,
+              ": selected bands did not span required spectral regions")
+      next
+    }
+    xtrain <- indices_for_data(train, pairs)
+    xtest <- indices_for_data(test, pairs)
+    selected[[length(selected) + 1]] <- data.frame(Group = group_name, Fold = f,
+      Alpha = en$alpha, Band = en$bands)
+    for (model in c("RF", "SVM")) {
+      pred <- tryCatch(fit_predict(xtrain, train$NNI_target, xtest, model),
+                       error = function(e) {message(conditionMessage(e)); rep(NA_real_, nrow(test))})
+      i <- i + 1
+      outputs[[i]] <- data.frame(Group = group_name, Fold = f, Model = model,
+        Plot_ID = test$Plot_ID, Observed = test$NNI_target, Predicted = pred)
+    }
+  }
+  if (!length(outputs)) return(NULL)
+  list(predictions = bind_rows(outputs), selected_bands = bind_rows(selected))
+}
+```
+
+```{r run-models}
+# Change the switch in Section 2 to explicitly allow exploratory R5-R6 model.
+groups_to_run <- c("V8", "R1-R2")
+if (run_late_unvalidated) groups_to_run <- c(groups_to_run, "R5-R6")
+
+results <- lapply(groups_to_run, function(g) {
+  evaluate_group(filter(corn, Group == g), g)
+})
+results <- Filter(Negate(is.null), results)
+
+if (length(results)) {
+  predictions <- bind_rows(lapply(results, `[[`, "predictions"))
+  band_selection <- bind_rows(lapply(results, `[[`, "selected_bands"))
+  write.csv(predictions, file.path(output_dir, "heldout_plot_predictions.csv"), row.names = FALSE)
+  write.csv(band_selection, file.path(output_dir, "elastic_net_bands_by_fold.csv"), row.names = FALSE)
+} else {
+  message("No eligible model runs. See audit and selected-band warnings.")
+}
+```
+
+## 9. Report the model accuracy and inspect the chosen bands
+
+```{r results}
+if (exists("predictions")) {
+  performance <- predictions %>%
+    filter(is.finite(Predicted)) %>%
+    group_by(Group, Model) %>%
+    group_modify(~ safe_metrics(.x$Observed, .x$Predicted)) %>%
+    ungroup()
+  print(performance)
+  write.csv(performance, file.path(output_dir, "group_model_performance.csv"), row.names = FALSE)
+
+  print(ggplot(filter(predictions, is.finite(Predicted)),
+               aes(Observed, Predicted, color = Model)) +
+    geom_point(alpha = 0.75) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    facet_grid(Group ~ Model, scales = "free") +
+    theme_bw() + labs(title = "Held-out-plot prediction", y = "Predicted target"))
+}
+```
+
+```{r selection-frequency}
+if (exists("band_selection") && nrow(band_selection)) {
+  frequency <- band_selection %>%
+    count(Group, Band, name = "Selected_in_folds") %>%
+    left_join(band_map, by = "Band") %>%
+    arrange(Group, desc(Selected_in_folds))
+  print(frequency %>% group_by(Group) %>% slice_head(n = 15), n = Inf)
+  write.csv(frequency, file.path(output_dir, "band_selection_frequency.csv"), row.names = FALSE)
+}
+```
+
+## 10. Research decisions before publication
+
+1. Verify critical N dilution calculations. The `R6_NNI_Combined` column **must not** be reported as standard whole-plant NNI merely because its values are numeric.
+2. `V8` and `R1-R2` currently use `R1 NNI`; check whether the R1 values are contemporaneous with **each** sampling date. If not, rename the objective as prediction of later R1 NNI from earlier reflectance, or provide contemporaneous early NNI values.
+3. The selection code uses training-only screening, but RF/SVM hyperparameters above are baseline values. A final manuscript should implement nested plot-grouped tuning for RF (`mtry`, `min.node.size`) and SVM (`C`, `sigma`, `epsilon`).
+4. Distinct study sites may have different nitrogen-management labels and canopy conditions. Validation on a separate year/site is a stronger generalization test than randomly held-out plots.
+5. Supply exact ENVI wavelengths to make vegetation index definitions defensible. Band endpoints are only approximately calibrated without the header.
+
+```{r}
+band_map %>%
+  filter(Band %in% selection$bands) %>%
+  mutate(
+    Region = region(Wavelength)
+  ) %>%
+  count(Region)
+```
+
+### 11.1 Settings for the raw-band comparison
+
+```{r raw-settings}
+raw_output <- file.path(output_dir, "raw_band_comparison")
+dir.create(raw_output, recursive = TRUE, showWarnings = FALSE)
+
+# Final research run: test k = all bands, all bands - 1, ..., 1
+raw_predictor_step <- 1L
+
+# For quick debugging only, use 10; switch back to 1 for the actual analysis.
+# raw_predictor_step <- 10L
+
+# False = rerun. True = read each completed group's CSV if present.
+reuse_raw_csv <- TRUE
+
+# Same groups as the NDSI analysis above (R5-R6 disabled by default).
+raw_groups <- groups_to_run
+```
+
+### 11.2 Training-only ordering of raw bands
+
+```{r raw-ranking}
+rank_raw_bands <- function(train) {
+  y <- train$NNI_target
+  x <- as.matrix(train[, band_cols, drop = FALSE])
+
+  # Constant or invalid bands in this training fold are not usable.
+  usable <- vapply(seq_len(ncol(x)), function(j) {
+    all(is.finite(x[, j])) && sd(x[, j]) > 0
+  }, logical(1))
+
+  x <- x[, usable, drop = FALSE]
+  if (ncol(x) < 1) return(character())
+
+  # Use *training data only*. No test labels enter ranking.
+  scores <- vapply(seq_len(ncol(x)), function(j) {
+    val <- suppressWarnings(
+      cor(x[, j], y, method = "spearman")
+    )
+    if (is.finite(val)) abs(val) else 0
+  }, numeric(1))
+
+  colnames(x)[order(scores, decreasing = TRUE)]
+}
+```
+
+### 11.3 Run RF and SVM at every raw-band predictor count
+
+```{r raw-evaluate-function}
+evaluate_raw_path <- function(dat, group_name) {
+
+  dat <- dat %>% filter(is.finite(NNI_target))
+  good_rows <- rowSums(
+    !is.finite(as.matrix(dat[, band_cols, drop = FALSE]))
+  ) == 0
+  dat <- dat[good_rows, , drop = FALSE]
+
+  if (n_distinct(dat$Plot_ID) < 8 || nrow(dat) < 12) {
+    message("Skipping raw-band comparison for ", group_name,
+            ": insufficient independent plots")
+    return(NULL)
+  }
+
+  fold <- make_folds(dat$Plot_ID, n_folds, seed)
+  outputs <- list()
+  counter <- 0L
+
+  for (f in sort(unique(fold))) {
+    train <- dat[fold != f, , drop = FALSE]
+    test <- dat[fold == f, , drop = FALSE]
+
+    ranked <- rank_raw_bands(train)
+    p <- length(ranked)
+    if (p < 1) next
+
+    # Every possible predictor count from p down to 1 by default.
+    k_values <- unique(c(seq(p, 1L, by = -raw_predictor_step), 1L))
+    k_values <- sort(k_values, decreasing = TRUE)
+
+    message("Group ", group_name, " | fold ", f,
+            " | usable bands ", p, " | sizes ", length(k_values))
+
+    for (k in k_values) {
+      predictors <- ranked[seq_len(k)]
+      train_x <- as.data.frame(train[, predictors, drop = FALSE])
+      test_x <- as.data.frame(test[, predictors, drop = FALSE])
+
+      for (method in c("RF", "SVM")) {
+        estimate <- tryCatch(
+          fit_predict(train_x, train$NNI_target, test_x, method),
+          error = function(e) {
+            message("Error in ", group_name, " fold ", f,
+                    " k=", k, " ", method, ": ", conditionMessage(e))
+            rep(NA_real_, nrow(test))
+          }
+        )
+
+        counter <- counter + 1L
+        outputs[[counter]] <- data.frame(
+          Group = group_name,
+          Fold = f,
+          Model = method,
+          Predictor_Set = "Raw bands",
+          Predictors = k,
+          Max_Predictors_Fold = p,
+          Plot_ID = test$Plot_ID,
+          Observed = test$NNI_target,
+          Predicted = as.numeric(estimate)
+        )
+      }
+    }
+  }
+
+  if (!length(outputs)) return(NULL)
+  bind_rows(outputs)
+}
+```
+
+### 11.4 Run all groups and save raw-band predictions
+
+```{r raw-run, cache=FALSE}
+raw_results <- list()
+
+for (g in raw_groups) {
+  path_g <- file.path(raw_output, paste0("raw_predictions_", g, ".csv"))
+
+  if (reuse_raw_csv && file.exists(path_g)) {
+    message("Reading saved raw-band path for ", g)
+    raw_results[[g]] <- read.csv(path_g, stringsAsFactors = FALSE)
+  } else {
+    result_g <- evaluate_raw_path(filter(corn, Group == g), g)
+    if (!is.null(result_g)) {
+      write.csv(result_g, path_g, row.names = FALSE)
+      raw_results[[g]] <- result_g
+    }
+  }
+}
+
+raw_predictions <- bind_rows(raw_results)
+if (nrow(raw_predictions) > 0) {
+  write.csv(raw_predictions,
+            file.path(raw_output, "raw_predictions_all_groups.csv"),
+            row.names = FALSE)
+}
+```
+
+### 11.5 Accuracy at every predictor count, compared with NDSIs
+
+```{r raw-performance}
+raw_performance <- data.frame()
+
+if (nrow(raw_predictions) > 0) {
+  raw_performance <- raw_predictions %>%
+    filter(is.finite(Predicted)) %>%
+    group_by(Group, Model, Predictor_Set, Predictors) %>%
+    group_modify(~ safe_metrics(.x$Observed, .x$Predicted)) %>%
+    ungroup()
+
+  write.csv(raw_performance,
+            file.path(raw_output, "raw_performance_every_k.csv"),
+            row.names = FALSE)
+
+  print(raw_performance %>%
+          group_by(Group, Model) %>%
+          arrange(desc(Predictors), .by_group = TRUE) %>%
+          slice_head(n = 5), n = Inf)
+}
+
+# The NDSI metrics already created in Section 9 are the comparator.
+ndsi_comparison <- data.frame()
+if (exists("performance") && nrow(performance) > 0) {
+  ndsi_comparison <- performance %>%
+    mutate(Predictor_Set = "ENet-selected NDSIs",
+           Predictors = NA_integer_) %>%
+    select(Group, Model, Predictor_Set, Predictors, n, RMSE, MAE, R2, Bias)
+}
+
+if (nrow(raw_performance) > 0) {
+  comparison_every_k <- bind_rows(
+    raw_performance %>%
+      select(Group, Model, Predictor_Set, Predictors, n, RMSE, MAE, R2, Bias),
+    ndsi_comparison
+  )
+
+  write.csv(comparison_every_k,
+            file.path(raw_output, "raw_vs_NDSI_comparison.csv"),
+            row.names = FALSE)
+}
+```
+
+### 11.6 Plot model accuracy as the number of bands decreases
+
+```{r raw-accuracy-curve, fig.width=11, fig.height=6}
+if (nrow(raw_performance) > 0) {
+  ggplot(raw_performance,
+         aes(x = Predictors, y = RMSE, color = Model)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    facet_wrap(~ Group, scales = "free_y") +
+    labs(title = "Raw hyperspectral bands: prediction error vs complexity",
+         subtitle = "Training-fold ranking; held-out-plot predictions",
+         x = "Number of raw bands used as predictors",
+         y = "Cross-validated RMSE",
+         color = "Algorithm") +
+    theme_bw(base_size = 13)
+}
+```
+
+```{r raw-r2-curve, fig.width=11, fig.height=6}
+if (nrow(raw_performance) > 0) {
+  ggplot(raw_performance,
+         aes(x = Predictors, y = R2, color = Model)) +
+    geom_hline(yintercept = 0, linetype = 2, color = "gray50") +
+    geom_line(linewidth = 0.8) +
+    facet_wrap(~ Group) +
+    labs(title = "Raw band complexity vs held-out-plot R²",
+         x = "Number of raw bands used as predictors",
+         y = "Cross-validated R²",
+         color = "Algorithm") +
+    theme_bw(base_size = 13)
+}
+```
+
+### 11.7 Find a simpler model, accounting for fold-to-fold error variation
+
+This descriptive **one-standard-error** rule selects the **smallest k** whose mean fold RMSE is within one standard error of the minimum mean fold RMSE. It does not create a new independent held-out evaluation of that selected k. A repeat with nested tuning is needed before reporting the selected-k result as final predictive accuracy.
+
+```{r raw-simplest}
+raw_fold_metrics <- data.frame()
+raw_simple <- data.frame()
+
+if (nrow(raw_predictions) > 0) {
+  raw_fold_metrics <- raw_predictions %>%
+    filter(is.finite(Predicted)) %>%
+    group_by(Group, Model, Predictors, Fold) %>%
+    summarise(
+      Fold_RMSE = sqrt(mean((Observed - Predicted)^2)),
+      .groups = "drop"
+    )
+
+  raw_summaries <- raw_fold_metrics %>%
+    group_by(Group, Model, Predictors) %>%
+    summarise(
+      Mean_RMSE = mean(Fold_RMSE),
+      SE_RMSE = sd(Fold_RMSE) / sqrt(n()),
+      Folds = n(),
+      .groups = "drop"
+    )
+
+  raw_simple <- raw_summaries %>%
+    group_by(Group, Model) %>%
+    group_modify(~ {
+      best <- .x[which.min(.x$Mean_RMSE), , drop = FALSE]
+      threshold <- best$Mean_RMSE + best$SE_RMSE
+      eligible <- .x[.x$Mean_RMSE <= threshold, , drop = FALSE]
+      simplest <- eligible[which.min(eligible$Predictors), , drop = FALSE]
+      simplest$Best_k <- best$Predictors
+      simplest$Best_mean_RMSE <- best$Mean_RMSE
+      simplest$Threshold_1SE <- threshold
+      simplest
+    }) %>%
+    ungroup()
+
+  write.csv(raw_simple,
+            file.path(raw_output, "exploratory_simplest_models_1SE.csv"),
+            row.names = FALSE)
+  print(raw_simple, n = Inf)
+}
+```
+
+### 11.8 Poster-focused comparison: full spectrum, simpler raw bands, NDSI
+
+```{r raw-poster-table}
+if (nrow(raw_performance) > 0) {
+  full_raw <- raw_performance %>%
+    group_by(Group, Model) %>%
+    filter(Predictors == max(Predictors)) %>%
+    ungroup() %>%
+    mutate(Approach = "All raw bands")
+
+  simplest_raw <- raw_simple %>%
+    select(Group, Model, Predictors) %>%
+    inner_join(raw_performance,
+               by = c("Group", "Model", "Predictors")) %>%
+    mutate(Approach = "Exploratory simplest raw")
+
+  poster_comparison <- bind_rows(
+    full_raw,
+    simplest_raw,
+    ndsi_comparison %>% mutate(Approach = "ENet-selected NDSIs")
+  ) %>%
+    select(Group, Model, Approach, Predictors, n, R2, RMSE, MAE, Bias)
+
+  print(poster_comparison, n = Inf)
+  write.csv(poster_comparison,
+            file.path(raw_output, "poster_model_comparison.csv"),
+            row.names = FALSE)
+}
+```
